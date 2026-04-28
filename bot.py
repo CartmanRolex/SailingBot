@@ -4,6 +4,7 @@ import logging.handlers
 import signal
 import sys
 import time
+from datetime import date, timedelta
 
 import requests
 from bs4 import BeautifulSoup
@@ -148,12 +149,15 @@ class SailingBot:
         self.log.info(f"Login successful (landed on: {final_url})")
         return True
 
-    def _fetch_course_page(self):
+    def _fetch_week(self, refdate=None):
+        url = self.course_url
+        if refdate:
+            url += f"?refdate={refdate}"
         try:
-            resp = self.session.get(self.course_url, timeout=15)
+            resp = self.session.get(url, timeout=15)
             resp.raise_for_status()
         except requests.RequestException as e:
-            self.log.error(f"Failed to fetch course page: {e}")
+            self.log.error(f"Failed to fetch course page ({refdate or 'current'}): {e}")
             return None
 
         if "login" in resp.url.lower():
@@ -161,7 +165,7 @@ class SailingBot:
             if not self.login():
                 raise RuntimeError("Re-login failed")
             try:
-                resp = self.session.get(self.course_url, timeout=15)
+                resp = self.session.get(url, timeout=15)
                 resp.raise_for_status()
             except requests.RequestException as e:
                 self.log.error(f"Failed to fetch course page after re-login: {e}")
@@ -169,14 +173,8 @@ class SailingBot:
 
         return resp
 
-    def check_availability(self):
-        resp = self._fetch_course_page()
-        if resp is None:
-            return []
-
-        soup = BeautifulSoup(resp.text, "lxml")
+    def _parse_week(self, soup):
         available = []
-
         for item in soup.find_all("div", class_="cours_item"):
             # Skip past courses
             if "cours_item_old" in item.get("class", []):
@@ -213,11 +211,11 @@ class SailingBot:
             col4 = item.find("div", class_="col-md-4", recursive=False)
             col5 = item.find("div", class_="col-md-5", recursive=False)
 
-            # Date: the desktop-only short date (hidden on xs/sm, shown on md/lg)
-            date_el = col4.select_one(".hidden-xs.hidden-sm") if col4 else None
-            # Fallback: mobile date that always shows (hidden on lg/md)
+            # Prefer the mobile date (always full: "mar 28.04.26") over the desktop
+            # short version ("mar 28") which is empty for subsequent courses on same day.
+            date_el = col4.select_one(".hidden-lg.hidden-md.col-md-2") if col4 else None
             if not date_el or not date_el.get_text(strip=True):
-                date_el = col4.select_one(".hidden-lg.hidden-md.col-md-2") if col4 else None
+                date_el = col4.select_one(".hidden-xs.hidden-sm") if col4 else None
             date_str = date_el.get_text(strip=True) if date_el else ""
 
             # Time: the small col-md-4 div inside col4
@@ -241,6 +239,7 @@ class SailingBot:
                 href = "https://www2.unil.ch" + onclick.split("'")[1]
 
             available.append({
+                "date": date_str,
                 "course": course_name,
                 "time": time_str,
                 "level": level,
@@ -248,6 +247,23 @@ class SailingBot:
                 "enrollment": enrollment,
                 "href": href,
             })
+
+        return available
+
+    def check_availability(self):
+        # Check current week + next 3 weeks
+        monday = date.today() - timedelta(days=date.today().weekday())
+        weeks = [None] + [
+            (monday + timedelta(weeks=i)).strftime("%Y%m%d") for i in range(1, 4)
+        ]
+
+        available = []
+        for refdate in weeks:
+            resp = self._fetch_week(refdate)
+            if resp is None:
+                continue
+            soup = BeautifulSoup(resp.text, "lxml")
+            available.extend(self._parse_week(soup))
 
         return available
 
@@ -264,7 +280,7 @@ class SailingBot:
     def _format_notification(self, slots):
         lines = [f"<b>🚣 {len(slots)} sailing slot(s) available!</b>", ""]
         for slot in slots[:10]:
-            lines.append(f"📅 {slot['time']}  <b>{slot['course']}</b>")
+            lines.append(f"📅 <b>{slot['date']}  {slot['time']}</b>  —  {slot['course']}")
             lines.append(f"   Level: {slot['level']} | Instructor: {slot['instructor']} | Places: {slot['enrollment']}")
             if slot.get("href"):
                 lines.append(f"   <a href=\"{slot['href']}\">Register now</a>")
