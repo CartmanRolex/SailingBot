@@ -146,6 +146,66 @@ class SailingBot:
         self.log.info(f"Login successful (landed on: {final_url})")
         return True
 
+    def check_availability(self):
+        try:
+            resp = self.session.get(self.course_url, timeout=15)
+            resp.raise_for_status()
+        except requests.RequestException as e:
+            self.log.error(f"Failed to fetch course page: {e}")
+            return []
+
+        # Detect session expiry via redirect back to login
+        if "login" in resp.url.lower():
+            self.log.warning("Session expired — re-logging in...")
+            if not self.login():
+                raise RuntimeError("Re-login failed")
+            try:
+                resp = self.session.get(self.course_url, timeout=15)
+                resp.raise_for_status()
+            except requests.RequestException as e:
+                self.log.error(f"Failed to fetch course page after re-login: {e}")
+                return []
+
+        soup = BeautifulSoup(resp.text, "lxml")
+        available = []
+        seen = set()
+
+        available_keywords = ["s'inscrire", "inscription", "réserver", "disponible", "place libre", "inscrire"]
+        full_keywords = ["complet", "fermé", "aucune place", "plus de place", "liste d'attente", "full", "closed"]
+
+        # Pass 1: clickable elements with positive keywords
+        for tag in soup.find_all(["a", "button", "input"]):
+            if tag.get("disabled"):
+                continue
+            text = tag.get_text(strip=True).lower()
+            if any(kw in text for kw in available_keywords):
+                if not any(kw in text for kw in full_keywords):
+                    key = tag.get_text(strip=True)[:100]
+                    if key not in seen:
+                        seen.add(key)
+                        available.append({
+                            "text": tag.get_text(strip=True),
+                            "href": tag.get("href", ""),
+                            "source": "link/button",
+                        })
+
+        # Pass 2: table rows with positive keywords (exclude rows already captured)
+        for row in soup.find_all("tr"):
+            row_text = row.get_text(" ", strip=True)
+            row_lower = row_text.lower()
+            if any(kw in row_lower for kw in available_keywords):
+                if not any(kw in row_lower for kw in full_keywords):
+                    key = row_text[:100]
+                    if key not in seen:
+                        seen.add(key)
+                        available.append({
+                            "text": row_text[:300],
+                            "href": "",
+                            "source": "table_row",
+                        })
+
+        return available
+
 
 def main():
     bot = SailingBot(CONFIG_FILE)
