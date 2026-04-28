@@ -4,6 +4,7 @@ import logging.handlers
 import signal
 import sys
 import time
+import unicodedata
 from datetime import date, timedelta
 
 import requests
@@ -20,9 +21,14 @@ REQUIRED_KEYS = {
 }
 
 
+def _normalize(s):
+    """Strip diacritics and lowercase — so 'Dériveur' matches 'deriveur' or 'Deriveur'."""
+    return unicodedata.normalize("NFD", s).encode("ascii", "ignore").decode().lower()
+
+
 def _parse_filter_list(raw):
-    """Split a comma-separated config value into a lowercase stripped list, dropping empties."""
-    return [v.strip().lower() for v in raw.split(",") if v.strip()]
+    """Split a comma-separated config value into normalized tokens, dropping empties."""
+    return [_normalize(v.strip()) for v in raw.split(",") if v.strip()]
 
 
 class SailingBot:
@@ -276,12 +282,12 @@ class SailingBot:
         if self.filter_courses:
             available = [
                 s for s in available
-                if any(f in s["course"].lower() for f in self.filter_courses)
+                if any(f in _normalize(s["course"]) for f in self.filter_courses)
             ]
         if self.filter_instructors:
             available = [
                 s for s in available
-                if any(f in s["instructor"].lower() for f in self.filter_instructors)
+                if any(f in _normalize(s["instructor"]) for f in self.filter_instructors)
             ]
 
         return available
