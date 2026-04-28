@@ -5,7 +5,7 @@ import signal
 import sys
 import time
 import unicodedata
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 import requests
 from bs4 import BeautifulSoup
@@ -48,7 +48,8 @@ class SailingBot:
         self.session.headers.update({"User-Agent": "Mozilla/5.0 (compatible; SailingBot/1.0)"})
         self.form_action = LOGIN_URL
         self._running = False
-        self._seen_slots = set()  # tracks slot keys from the previous check
+        self._seen_slots = set()
+        self._last_heartbeat = 0.0
 
     def _load_config(self, path):
         config = configparser.ConfigParser()
@@ -302,6 +303,13 @@ class SailingBot:
         except requests.RequestException as e:
             self.log.error(f"Telegram request error: {e}")
 
+    def _format_heartbeat(self, slots):
+        now = datetime.now().strftime("%d.%m.%Y %H:%M")
+        return (
+            f"💓 <b>Bot alive</b>  —  {now}\n"
+            f"📊 {len(slots)} slot(s) currently available (next 3 weeks)"
+        )
+
     def _format_notification(self, new_slots, all_slots):
         lines = [f"🚣 <b>{len(new_slots)} new slot(s) just opened!</b>"]
         if len(all_slots) > len(new_slots):
@@ -338,6 +346,7 @@ class SailingBot:
             sys.exit(1)
 
         self.log.info(f"Polling every {self.interval}s. Press Ctrl+C to stop.")
+        self._last_heartbeat = time.time()
 
         while self._running:
             try:
@@ -361,6 +370,11 @@ class SailingBot:
                     self.log.info(f"Telegram notification sent ({len(new_slots)} new slot(s))")
 
                 self._seen_slots = current_keys
+
+                if time.time() - self._last_heartbeat >= 8 * 3600:
+                    self.send_telegram(self._format_heartbeat(slots))
+                    self._last_heartbeat = time.time()
+                    self.log.info("Heartbeat sent")
 
             except Exception as e:
                 self.log.error(f"Unexpected error during check: {e}", exc_info=True)
