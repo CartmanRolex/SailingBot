@@ -3,6 +3,9 @@ import logging
 import logging.handlers
 import sys
 
+import requests
+from bs4 import BeautifulSoup
+
 CONFIG_FILE = "config.ini"
 LOGIN_URL = "https://www2.unil.ch/sportres/nautique/login.php"
 BASE_URL = "https://www2.unil.ch/sportres/nautique/"
@@ -25,6 +28,8 @@ class SailingBot:
         self.course_url = self.config["settings"]["course_url"]
         self.log_file = self.config["settings"]["log_file"]
         self.log = self._setup_logging()
+        self.session = requests.Session()
+        self.session.headers.update({"User-Agent": "Mozilla/5.0 (compatible; SailingBot/1.0)"})
         self.form_action = LOGIN_URL
         self._running = False
         self._already_notified = False
@@ -66,6 +71,80 @@ class SailingBot:
         logger.addHandler(stream_handler)
         logger.addHandler(file_handler)
         return logger
+
+    def _detect_login_fields(self, soup):
+        # Find the form that contains a password input
+        form = None
+        for f in soup.find_all("form"):
+            if f.find("input", {"type": "password"}):
+                form = f
+                break
+        if form is None:
+            form = soup.find("form")
+        if form is None:
+            raise RuntimeError("No form found on the login page")
+
+        action = form.get("action", LOGIN_URL)
+        if action and not action.startswith("http"):
+            action = BASE_URL + action.lstrip("/")
+        self.form_action = action or LOGIN_URL
+
+        payload = {}
+        email_filled = False
+        for inp in form.find_all("input"):
+            input_type = inp.get("type", "text").lower()
+            name = inp.get("name", "").strip()
+            if not name:
+                continue
+            if input_type == "hidden":
+                payload[name] = inp.get("value", "")
+            elif input_type == "password":
+                payload[name] = self.password
+            elif input_type in ("text", "email") and not email_filled:
+                payload[name] = self.email
+                email_filled = True
+
+        self.log.debug(f"Detected form action: {self.form_action}, fields: {list(payload.keys())}")
+        return payload
+
+    def login(self):
+        self.log.info("Attempting login...")
+        try:
+            resp = self.session.get(LOGIN_URL, timeout=15)
+            resp.raise_for_status()
+        except requests.RequestException as e:
+            self.log.error(f"Failed to fetch login page: {e}")
+            return False
+
+        soup = BeautifulSoup(resp.text, "lxml")
+        try:
+            payload = self._detect_login_fields(soup)
+        except RuntimeError as e:
+            self.log.error(f"Login form detection failed: {e}")
+            return False
+
+        if not payload:
+            self.log.error("No fields detected in login form — cannot log in")
+            return False
+
+        try:
+            post_resp = self.session.post(self.form_action, data=payload, timeout=15)
+            post_resp.raise_for_status()
+        except requests.RequestException as e:
+            self.log.error(f"Login POST failed: {e}")
+            return False
+
+        # Detect success: redirected away from login page, or login form no longer present
+        final_url = post_resp.url
+        post_soup = BeautifulSoup(post_resp.text, "lxml")
+        still_on_login = bool(post_soup.find("input", {"type": "password"}))
+
+        if still_on_login or "login" in final_url.lower():
+            self.log.error("Login failed — still on login page. Check your credentials.")
+            return False
+
+        self.log.info(f"Login successful (landed on: {final_url})")
+        return True
 
 
 def main():
