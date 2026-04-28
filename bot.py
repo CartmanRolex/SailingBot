@@ -42,7 +42,7 @@ class SailingBot:
         self.session.headers.update({"User-Agent": "Mozilla/5.0 (compatible; SailingBot/1.0)"})
         self.form_action = LOGIN_URL
         self._running = False
-        self._already_notified = False
+        self._seen_slots = set()  # tracks slot keys from the previous check
 
     def _load_config(self, path):
         config = configparser.ConfigParser()
@@ -296,15 +296,20 @@ class SailingBot:
         except requests.RequestException as e:
             self.log.error(f"Telegram request error: {e}")
 
-    def _format_notification(self, slots):
-        lines = [f"<b>🚣 {len(slots)} slot(s) available (next 3 weeks)</b>", ""]
-        for slot in slots[:15]:
+    def _format_notification(self, new_slots, all_slots):
+        lines = [f"🚣 <b>{len(new_slots)} new slot(s) just opened!</b>"]
+        if len(all_slots) > len(new_slots):
+            lines.append(f"<i>({len(all_slots)} total available over the next 3 weeks)</i>")
+        lines.append("")
+
+        lines.append("🆕 <b>Newly available:</b>")
+        for slot in new_slots[:15]:
             lines.append(
-                f"<b>{slot['date']}</b>  {slot['time']}  |  {slot['course']}  |  "
-                f"{slot['instructor']}  |  {slot['enrollment']}"
+                f"  📅 <b>{slot['date']}</b>  🕐 {slot['time']}\n"
+                f"  ⛵ {slot['course']}  •  👤 {slot['instructor']}  •  🪑 {slot['enrollment']}"
             )
         lines.append("")
-        lines.append(f"<a href=\"{self.course_url}\">View &amp; register</a>")
+        lines.append(f"🔗 <a href=\"{self.course_url}\">View &amp; register</a>")
         return "\n".join(lines)
 
     def _shutdown(self, signum, frame):
@@ -331,15 +336,25 @@ class SailingBot:
         while self._running:
             try:
                 slots = self.check_availability()
-                self.log.info(f"Check complete: {len(slots)} available slot(s) found")
 
-                if slots and not self._already_notified:
-                    message = self._format_notification(slots)
+                # Identify each slot by its unique href (or date+time+course as fallback)
+                current_keys = {
+                    s["href"] or f"{s['date']}|{s['time']}|{s['course']}"
+                    for s in slots
+                }
+                new_keys = current_keys - self._seen_slots
+                new_slots = [s for s in slots if (s["href"] or f"{s['date']}|{s['time']}|{s['course']}") in new_keys]
+
+                self.log.info(
+                    f"Check complete: {len(slots)} available, {len(new_slots)} new"
+                )
+
+                if new_slots:
+                    message = self._format_notification(new_slots, slots)
                     self.send_telegram(message)
-                    self._already_notified = True
-                    self.log.info("Telegram notification sent")
-                elif not slots:
-                    self._already_notified = False
+                    self.log.info(f"Telegram notification sent ({len(new_slots)} new slot(s))")
+
+                self._seen_slots = current_keys
 
             except Exception as e:
                 self.log.error(f"Unexpected error during check: {e}", exc_info=True)
