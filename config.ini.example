@@ -17,3 +17,11 @@ poll_interval_seconds = 300
 course_url = https://www2.unil.ch/sportres/nautique/inscriptions.php
 ; Log file path (relative to script directory)
 log_file = sailing_bot.log
+
+[filters]
+; Comma-separated list of course types to watch (leave empty = all courses)
+; Available types: Dériveur simple, Dériveur double, Catamaran, Entraînement à la régate
+course_types =
+; Comma-separated list of instructors to watch (leave empty = all instructors)
+; Partial matches work, e.g. "Mar" matches "Marine"
+instructors =

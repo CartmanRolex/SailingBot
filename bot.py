@@ -20,6 +20,11 @@ REQUIRED_KEYS = {
 }
 
 
+def _parse_filter_list(raw):
+    """Split a comma-separated config value into a lowercase stripped list, dropping empties."""
+    return [v.strip().lower() for v in raw.split(",") if v.strip()]
+
+
 class SailingBot:
     def __init__(self, config_path=CONFIG_FILE):
         self.config = self._load_config(config_path)
@@ -30,6 +35,8 @@ class SailingBot:
         self.interval = int(self.config["settings"]["poll_interval_seconds"])
         self.course_url = self.config["settings"]["course_url"]
         self.log_file = self.config["settings"]["log_file"]
+        self.filter_courses = _parse_filter_list(self.config.get("filters", "course_types", fallback=""))
+        self.filter_instructors = _parse_filter_list(self.config.get("filters", "instructors", fallback=""))
         self.log = self._setup_logging()
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": "Mozilla/5.0 (compatible; SailingBot/1.0)"})
@@ -265,6 +272,18 @@ class SailingBot:
             soup = BeautifulSoup(resp.text, "lxml")
             available.extend(self._parse_week(soup))
 
+        # Apply filters (case-insensitive, partial match)
+        if self.filter_courses:
+            available = [
+                s for s in available
+                if any(f in s["course"].lower() for f in self.filter_courses)
+            ]
+        if self.filter_instructors:
+            available = [
+                s for s in available
+                if any(f in s["instructor"].lower() for f in self.filter_instructors)
+            ]
+
         return available
 
     def send_telegram(self, message):
@@ -278,14 +297,14 @@ class SailingBot:
             self.log.error(f"Telegram request error: {e}")
 
     def _format_notification(self, slots):
-        lines = [f"<b>🚣 {len(slots)} sailing slot(s) available!</b>", ""]
-        for slot in slots[:10]:
-            lines.append(f"📅 <b>{slot['date']}  {slot['time']}</b>  —  {slot['course']}")
-            lines.append(f"   Level: {slot['level']} | Instructor: {slot['instructor']} | Places: {slot['enrollment']}")
-            if slot.get("href"):
-                lines.append(f"   <a href=\"{slot['href']}\">Register now</a>")
-            lines.append("")
-        lines.append(f"<a href=\"{self.course_url}\">View all courses</a>")
+        lines = [f"<b>🚣 {len(slots)} slot(s) available (next 3 weeks)</b>", ""]
+        for slot in slots[:15]:
+            lines.append(
+                f"<b>{slot['date']}</b>  {slot['time']}  |  {slot['course']}  |  "
+                f"{slot['instructor']}  |  {slot['enrollment']}"
+            )
+        lines.append("")
+        lines.append(f"<a href=\"{self.course_url}\">View &amp; register</a>")
         return "\n".join(lines)
 
     def _shutdown(self, signum, frame):
@@ -298,6 +317,10 @@ class SailingBot:
         self._running = True
 
         self.log.info("SailingBot starting up")
+        if self.filter_courses:
+            self.log.info(f"Course filter: {', '.join(self.filter_courses)}")
+        if self.filter_instructors:
+            self.log.info(f"Instructor filter: {', '.join(self.filter_instructors)}")
 
         if not self.login():
             self.log.critical("Initial login failed. Check your credentials in config.ini.")
