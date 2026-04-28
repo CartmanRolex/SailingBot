@@ -148,15 +148,14 @@ class SailingBot:
         self.log.info(f"Login successful (landed on: {final_url})")
         return True
 
-    def check_availability(self):
+    def _fetch_course_page(self):
         try:
             resp = self.session.get(self.course_url, timeout=15)
             resp.raise_for_status()
         except requests.RequestException as e:
             self.log.error(f"Failed to fetch course page: {e}")
-            return []
+            return None
 
-        # Detect session expiry via redirect back to login
         if "login" in resp.url.lower():
             self.log.warning("Session expired — re-logging in...")
             if not self.login():
@@ -166,45 +165,89 @@ class SailingBot:
                 resp.raise_for_status()
             except requests.RequestException as e:
                 self.log.error(f"Failed to fetch course page after re-login: {e}")
-                return []
+                return None
+
+        return resp
+
+    def check_availability(self):
+        resp = self._fetch_course_page()
+        if resp is None:
+            return []
 
         soup = BeautifulSoup(resp.text, "lxml")
         available = []
-        seen = set()
 
-        available_keywords = ["s'inscrire", "inscription", "réserver", "disponible", "place libre", "inscrire"]
-        full_keywords = ["complet", "fermé", "aucune place", "plus de place", "liste d'attente", "full", "closed"]
-
-        # Pass 1: clickable elements with positive keywords
-        for tag in soup.find_all(["a", "button", "input"]):
-            if tag.get("disabled"):
+        for item in soup.find_all("div", class_="cours_item"):
+            # Skip past courses
+            if "cours_item_old" in item.get("class", []):
                 continue
-            text = tag.get_text(strip=True).lower()
-            if any(kw in text for kw in available_keywords):
-                if not any(kw in text for kw in full_keywords):
-                    key = tag.get_text(strip=True)[:100]
-                    if key not in seen:
-                        seen.add(key)
-                        available.append({
-                            "text": tag.get_text(strip=True),
-                            "href": tag.get("href", ""),
-                            "source": "link/button",
-                        })
 
-        # Pass 2: table rows with positive keywords (exclude rows already captured)
-        for row in soup.find_all("tr"):
-            row_text = row.get_text(" ", strip=True)
-            row_lower = row_text.lower()
-            if any(kw in row_lower for kw in available_keywords):
-                if not any(kw in row_lower for kw in full_keywords):
-                    key = row_text[:100]
-                    if key not in seen:
-                        seen.add(key)
-                        available.append({
-                            "text": row_text[:300],
-                            "href": "",
-                            "source": "table_row",
-                        })
+            # The enrollment container is the direct-child col-md-3 of the item.
+            # (col-md-3 also appears nested inside col-md-5 for the level field,
+            #  so we must use recursive=False to avoid matching it.)
+            enrollment_container = item.find("div", class_="col-md-3", recursive=False)
+            if enrollment_container is None:
+                continue
+
+            # Bold enrollment = full (e.g. <strong>6 / 6</strong>)
+            if enrollment_container.find("strong"):
+                continue
+
+            # The actual count sits in the inner col-md-3 inside the container
+            inner_count = enrollment_container.find("div", class_="col-md-3")
+            enrollment = inner_count.get_text(strip=True) if inner_count else enrollment_container.get_text(strip=True)
+
+            # Parse X / Y to confirm there are actually free spots
+            try:
+                parts = enrollment.split("/")
+                current = int(parts[0].strip())
+                maximum = int(parts[1].strip())
+                if current >= maximum:
+                    continue
+            except (ValueError, IndexError):
+                # If we can't parse it and it's not bold, include it anyway
+                pass
+
+            # Use recursive=False to get only the direct-child col-md-4 and col-md-5,
+            # avoiding accidental matches from nested divs.
+            col4 = item.find("div", class_="col-md-4", recursive=False)
+            col5 = item.find("div", class_="col-md-5", recursive=False)
+
+            # Date: the desktop-only short date (hidden on xs/sm, shown on md/lg)
+            date_el = col4.select_one(".hidden-xs.hidden-sm") if col4 else None
+            # Fallback: mobile date that always shows (hidden on lg/md)
+            if not date_el or not date_el.get_text(strip=True):
+                date_el = col4.select_one(".hidden-lg.hidden-md.col-md-2") if col4 else None
+            date_str = date_el.get_text(strip=True) if date_el else ""
+
+            # Time: the small col-md-4 div inside col4
+            time_el = col4.select_one(".col-md-4.small") if col4 else None
+            time_str = time_el.get_text(strip=True) if time_el else ""
+
+            # Course name: the col-md-6 inside col4
+            name_el = col4.select_one(".col-md-6") if col4 else None
+            course_name = name_el.get_text(strip=True) if name_el else ""
+
+            # Level and instructor from col5
+            level_el = col5.select_one(".col-md-3") if col5 else None
+            instructor_el = col5.select_one(".col-md-5") if col5 else None
+            level = level_el.get_text(strip=True) if level_el else ""
+            instructor = instructor_el.get_text(strip=True) if instructor_el else ""
+
+            # Extract link from onclick attribute
+            onclick = item.get("onclick", "")
+            href = ""
+            if "window.location='" in onclick:
+                href = "https://www2.unil.ch" + onclick.split("'")[1]
+
+            available.append({
+                "course": course_name,
+                "time": time_str,
+                "level": level,
+                "instructor": instructor,
+                "enrollment": enrollment,
+                "href": href,
+            })
 
         return available
 
@@ -219,13 +262,14 @@ class SailingBot:
             self.log.error(f"Telegram request error: {e}")
 
     def _format_notification(self, slots):
-        lines = ["<b>Sailing course slot available!</b>", ""]
-        for i, slot in enumerate(slots[:10], 1):
-            lines.append(f"{i}. {slot['text'][:200]}")
+        lines = [f"<b>🚣 {len(slots)} sailing slot(s) available!</b>", ""]
+        for slot in slots[:10]:
+            lines.append(f"📅 {slot['time']}  <b>{slot['course']}</b>")
+            lines.append(f"   Level: {slot['level']} | Instructor: {slot['instructor']} | Places: {slot['enrollment']}")
             if slot.get("href"):
-                lines.append(f"   <a href=\"{slot['href']}\">Open link</a>")
-        lines.append("")
-        lines.append(f"<a href=\"{self.course_url}\">Go to registration page</a>")
+                lines.append(f"   <a href=\"{slot['href']}\">Register now</a>")
+            lines.append("")
+        lines.append(f"<a href=\"{self.course_url}\">View all courses</a>")
         return "\n".join(lines)
 
     def _shutdown(self, signum, frame):

@@ -14,6 +14,6 @@ chat_id = 123456789
 ; How often to check for available courses (in seconds)
 poll_interval_seconds = 300
 ; URL of the course listing/registration page
-course_url = https://www2.unil.ch/sportres/nautique/inscription.php
+course_url = https://www2.unil.ch/sportres/nautique/inscriptions.php
 ; Log file path (relative to script directory)
 log_file = sailing_bot.log
