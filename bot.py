@@ -1,7 +1,9 @@
 import configparser
 import logging
 import logging.handlers
+import signal
 import sys
+import time
 
 import requests
 from bs4 import BeautifulSoup
@@ -206,10 +208,71 @@ class SailingBot:
 
         return available
 
+    def send_telegram(self, message):
+        url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
+        payload = {"chat_id": self.chat_id, "text": message, "parse_mode": "HTML"}
+        try:
+            resp = requests.post(url, json=payload, timeout=10)
+            if not resp.ok:
+                self.log.error(f"Telegram send failed: {resp.status_code} {resp.text[:200]}")
+        except requests.RequestException as e:
+            self.log.error(f"Telegram request error: {e}")
+
+    def _format_notification(self, slots):
+        lines = ["<b>Sailing course slot available!</b>", ""]
+        for i, slot in enumerate(slots[:10], 1):
+            lines.append(f"{i}. {slot['text'][:200]}")
+            if slot.get("href"):
+                lines.append(f"   <a href=\"{slot['href']}\">Open link</a>")
+        lines.append("")
+        lines.append(f"<a href=\"{self.course_url}\">Go to registration page</a>")
+        return "\n".join(lines)
+
+    def _shutdown(self, signum, frame):
+        self.log.info("Shutdown signal received — stopping...")
+        self._running = False
+
+    def run(self):
+        signal.signal(signal.SIGINT, self._shutdown)
+        signal.signal(signal.SIGTERM, self._shutdown)
+        self._running = True
+
+        self.log.info("SailingBot starting up")
+
+        if not self.login():
+            self.log.critical("Initial login failed. Check your credentials in config.ini.")
+            sys.exit(1)
+
+        self.log.info(f"Polling every {self.interval}s. Press Ctrl+C to stop.")
+
+        while self._running:
+            try:
+                slots = self.check_availability()
+                self.log.info(f"Check complete: {len(slots)} available slot(s) found")
+
+                if slots and not self._already_notified:
+                    message = self._format_notification(slots)
+                    self.send_telegram(message)
+                    self._already_notified = True
+                    self.log.info("Telegram notification sent")
+                elif not slots:
+                    self._already_notified = False
+
+            except Exception as e:
+                self.log.error(f"Unexpected error during check: {e}", exc_info=True)
+
+            # Sleep in small increments so Ctrl+C is responsive
+            for _ in range(self.interval):
+                if not self._running:
+                    break
+                time.sleep(1)
+
+        self.log.info("SailingBot stopped.")
+
 
 def main():
     bot = SailingBot(CONFIG_FILE)
-    bot.log.info("SailingBot initialized successfully.")
+    bot.run()
 
 
 if __name__ == "__main__":
