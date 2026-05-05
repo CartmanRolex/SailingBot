@@ -48,8 +48,11 @@ class SailingBot:
         self.session.headers.update({"User-Agent": "Mozilla/5.0 (compatible; SailingBot/1.0)"})
         self.form_action = LOGIN_URL
         self._running = False
-        self._seen_slots = set()
+        self._prev_slot_keys = None
         self._last_heartbeat = 0.0
+
+    def _slot_key(self, slot):
+        return slot["href"] if slot["href"] else f"{slot['date']}|{slot['time']}|{slot['course']}"
 
     def _load_config(self, path):
         config = configparser.ConfigParser()
@@ -291,7 +294,14 @@ class SailingBot:
                 if any(f in _normalize(s["instructor"]) for f in self.filter_instructors)
             ]
 
-        return available
+        seen_in_pass = set()
+        deduped = []
+        for s in available:
+            k = self._slot_key(s)
+            if k not in seen_in_pass:
+                seen_in_pass.add(k)
+                deduped.append(s)
+        return deduped
 
     def send_telegram(self, message):
         url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
@@ -310,20 +320,39 @@ class SailingBot:
             f"📊 {len(slots)} slot(s) currently available (next 3 weeks)"
         )
 
-    def _format_notification(self, new_slots, all_slots):
-        lines = [f"🚣 <b>{len(new_slots)} new slot(s) just opened!</b>"]
-        if len(all_slots) > len(new_slots):
-            lines.append(f"<i>({len(all_slots)} total available over the next 3 weeks)</i>")
-        lines.append("")
+    def _format_update(self, slots, new_keys):
+        appeared = len(new_keys)
+        disappeared = (
+            len(self._prev_slot_keys - {self._slot_key(s) for s in slots})
+            if self._prev_slot_keys is not None else 0
+        )
 
-        lines.append("🆕 <b>Newly available:</b>")
-        for slot in new_slots[:15]:
-            lines.append(
-                f"  📅 <b>{slot['date']}</b>  🕐 {slot['time']}\n"
-                f"  ⛵ {slot['course']}  •  👤 {slot['instructor']}  •  🪑 {slot['enrollment']}"
-            )
+        if appeared and disappeared:
+            header = f"🔄 <b>Schedule changed</b> — {appeared} new, {disappeared} removed"
+        elif appeared:
+            header = f"🆕 <b>{appeared} new slot(s) appeared!</b>"
+        elif disappeared:
+            header = f"❌ <b>{disappeared} slot(s) no longer available</b>"
+        else:
+            header = "ℹ️ <b>Schedule updated</b>"
+
+        lines = [header, ""]
+        if slots:
+            lines.append(f"<b>All available slots ({len(slots)} total):</b>")
+            for slot in slots[:20]:
+                k = self._slot_key(slot)
+                line = (
+                    f"  📅 <b>{slot['date']}</b>  🕐 {slot['time']}\n"
+                    f"  ⛵ {slot['course']}  •  👤 {slot['instructor']}  •  🪑 {slot['enrollment']}"
+                )
+                if k in new_keys:
+                    line = f"<b>{line}</b>"
+                lines.append(line)
+        else:
+            lines.append("<i>No slots currently available.</i>")
+
         lines.append("")
-        lines.append(f"🔗 <a href=\"{self.course_url}\">View &amp; register</a>")
+        lines.append(f'🔗 <a href="{self.course_url}">View &amp; register</a>')
         return "\n".join(lines)
 
     def _shutdown(self, signum, frame):
@@ -351,25 +380,27 @@ class SailingBot:
         while self._running:
             try:
                 slots = self.check_availability()
+                current_keys = {self._slot_key(s) for s in slots}
 
-                # Identify each slot by its unique href (or date+time+course as fallback)
-                current_keys = {
-                    s["href"] or f"{s['date']}|{s['time']}|{s['course']}"
-                    for s in slots
-                }
-                new_keys = current_keys - self._seen_slots
-                new_slots = [s for s in slots if (s["href"] or f"{s['date']}|{s['time']}|{s['course']}") in new_keys]
+                if self._prev_slot_keys is None:
+                    new_keys = current_keys
+                    changed = bool(current_keys)
+                    self.log.info(f"First check: {len(slots)} slot(s) available")
+                else:
+                    new_keys = current_keys - self._prev_slot_keys
+                    removed_keys = self._prev_slot_keys - current_keys
+                    changed = bool(new_keys or removed_keys)
+                    self.log.info(
+                        f"Check complete: {len(slots)} available, "
+                        f"{len(new_keys)} new, {len(removed_keys)} removed"
+                    )
 
-                self.log.info(
-                    f"Check complete: {len(slots)} available, {len(new_slots)} new"
-                )
-
-                if new_slots:
-                    message = self._format_notification(new_slots, slots)
+                if changed:
+                    message = self._format_update(slots, new_keys)
                     self.send_telegram(message)
-                    self.log.info(f"Telegram notification sent ({len(new_slots)} new slot(s))")
+                    self.log.info("Telegram notification sent (schedule changed)")
 
-                self._seen_slots = current_keys
+                self._prev_slot_keys = current_keys
 
                 if time.time() - self._last_heartbeat >= 8 * 3600:
                     self.send_telegram(self._format_heartbeat(slots))
