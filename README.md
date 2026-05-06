@@ -82,10 +82,77 @@ Leave a filter empty to receive notifications for all courses / all instructors.
 | Nothing changed | silence |
 | Every 8 hours | 💓 heartbeat with slot count |
 
-## Running on a server
+## Running as a systemd service
+
+This is the recommended way to run the bot on a Linux server — it starts automatically on boot and restarts itself if it crashes.
+
+### 1. Create the service file
 
 ```bash
-nohup python bot.py &
+sudo nano /etc/systemd/system/sailingbot.service
 ```
 
-Or with systemd, screen, or tmux. The bot handles session expiry automatically (re-logins when the UNIL session expires) and catches all transient errors without crashing.
+Paste the following, adjusting the paths and user to match your setup:
+
+```ini
+[Unit]
+Description=SailingBot — UNIL course availability monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=your_user
+WorkingDirectory=/path/to/SailingBot
+ExecStart=/usr/bin/python3 /path/to/SailingBot/bot.py
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
+```
+
+> If you're using a virtual environment, replace `ExecStart` with:
+> ```
+> ExecStart=/path/to/SailingBot/venv/bin/python /path/to/SailingBot/bot.py
+> ```
+
+### 2. Enable and start the service
+
+```bash
+# Reload systemd to pick up the new file
+sudo systemctl daemon-reload
+
+# Enable it so it starts automatically on boot
+sudo systemctl enable sailingbot
+
+# Start it now
+sudo systemctl start sailingbot
+```
+
+### Useful commands
+
+```bash
+# Check if the bot is running
+sudo systemctl status sailingbot
+
+# View live logs
+sudo journalctl -u sailingbot -f
+
+# View last 100 lines of logs
+sudo journalctl -u sailingbot -n 100
+
+# Restart the bot (e.g. after editing config.ini)
+sudo systemctl restart sailingbot
+
+# Stop the bot
+sudo systemctl stop sailingbot
+
+# Disable auto-start on boot
+sudo systemctl disable sailingbot
+```
+
+> **After editing `config.ini`**, always restart the service for changes to take effect:
+> ```bash
+> sudo systemctl restart sailingbot
+> ```
