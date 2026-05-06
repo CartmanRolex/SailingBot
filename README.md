@@ -86,73 +86,75 @@ Leave a filter empty to receive notifications for all courses / all instructors.
 
 This is the recommended way to run the bot on a Linux server — it starts automatically on boot and restarts itself if it crashes.
 
+This uses a **user-level systemd service** (no `sudo` needed), which starts automatically on login and restarts on crash.
+
 ### 1. Create the service file
 
 ```bash
-sudo nano /etc/systemd/system/sailingbot.service
+mkdir -p ~/.config/systemd/user
+nano ~/.config/systemd/user/sailingbot.service
 ```
 
-Paste the following, adjusting the paths and user to match your setup:
+Paste the following, adjusting the paths to match your setup:
 
 ```ini
 [Unit]
-Description=SailingBot — UNIL course availability monitor
+Description=SailingBot sailing course monitor
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=your_user
 WorkingDirectory=/path/to/SailingBot
-ExecStart=/usr/bin/python3 /path/to/SailingBot/bot.py
+ExecStart=/path/to/SailingBot/venv/bin/python /path/to/SailingBot/bot.py
 Restart=on-failure
 RestartSec=30
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=default.target
 ```
 
-> If you're using a virtual environment, replace `ExecStart` with:
+> If you're not using a virtual environment, replace `ExecStart` with:
 > ```
-> ExecStart=/path/to/SailingBot/venv/bin/python /path/to/SailingBot/bot.py
+> ExecStart=/usr/bin/python3 /path/to/SailingBot/bot.py
 > ```
 
 ### 2. Enable and start the service
 
 ```bash
 # Reload systemd to pick up the new file
-sudo systemctl daemon-reload
+systemctl --user daemon-reload
 
-# Enable it so it starts automatically on boot
-sudo systemctl enable sailingbot
+# Enable it so it starts automatically on login
+systemctl --user enable sailingbot
 
 # Start it now
-sudo systemctl start sailingbot
+systemctl --user start sailingbot
 ```
 
 ### Useful commands
 
 ```bash
 # Check if the bot is running
-sudo systemctl status sailingbot
+systemctl --user status sailingbot
 
 # View live logs
-sudo journalctl -u sailingbot -f
+journalctl --user -u sailingbot -f
 
 # View last 100 lines of logs
-sudo journalctl -u sailingbot -n 100
+journalctl --user -u sailingbot -n 100
 
 # Restart the bot (e.g. after editing config.ini)
-sudo systemctl restart sailingbot
+systemctl --user restart sailingbot
 
 # Stop the bot
-sudo systemctl stop sailingbot
+systemctl --user stop sailingbot
 
 # Disable auto-start on boot
-sudo systemctl disable sailingbot
+systemctl --user disable sailingbot
 ```
 
 > **After editing `config.ini`**, always restart the service for changes to take effect:
 > ```bash
-> sudo systemctl restart sailingbot
+> systemctl --user restart sailingbot
 > ```
