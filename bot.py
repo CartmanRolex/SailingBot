@@ -55,6 +55,18 @@ def _config_int(config, section, option, fallback):
     return config.getint(section, option)
 
 
+def _parse_time_minutes(raw_time):
+    match = re.search(r"(\d{1,2}):(\d{2})", raw_time or "")
+    if not match:
+        return None
+
+    hour = int(match.group(1))
+    minute = int(match.group(2))
+    if hour > 23 or minute > 59:
+        return None
+    return hour * 60 + minute
+
+
 class SailingBot:
     def __init__(self, config_path=CONFIG_FILE):
         self.config = self._load_config(config_path)
@@ -86,6 +98,7 @@ class SailingBot:
         self.navigation_days_ahead = _config_int(
             self.config, "navigation_libre_filters", "days_ahead", fallback=21
         )
+        self.navigation_time_filters = self._load_navigation_time_filters()
         self.log = self._setup_logging()
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": "Mozilla/5.0 (compatible; SailingBot/1.0)"})
@@ -122,6 +135,85 @@ class SailingBot:
         if slot_date is None:
             return True
         return date.today() <= slot_date <= date.today() + timedelta(days=days_ahead)
+
+    def _parse_slot_time_range(self, raw_time):
+        parts = re.findall(r"\d{1,2}:\d{2}", raw_time or "")
+        if not parts:
+            return None, None
+
+        start = _parse_time_minutes(parts[0])
+        end = _parse_time_minutes(parts[1]) if len(parts) > 1 else None
+        return start, end
+
+    def _load_navigation_time_filters(self):
+        section = "navigation_libre_time_filters"
+        if not self.config.has_section(section):
+            return []
+
+        filters = []
+        aliases = {
+            "after": "start_after",
+            "start_after": "start_after",
+            "from": "start_after",
+            "before": "start_before",
+            "start_before": "start_before",
+            "until": "start_before",
+            "end_after": "end_after",
+            "end_before": "end_before",
+        }
+        pattern = re.compile(
+            r"\b(after|start_after|from|before|start_before|until|end_after|end_before)"
+            r"\s*(?:=|:)?\s*(\d{1,2}:\d{2})",
+            re.IGNORECASE,
+        )
+
+        for support_pattern, raw_rule in self.config.items(section):
+            constraints = {}
+            for match in pattern.finditer(raw_rule):
+                key = aliases[match.group(1).lower()]
+                minutes = _parse_time_minutes(match.group(2))
+                if minutes is not None:
+                    constraints[key] = minutes
+
+            normalized_pattern = _normalize(support_pattern)
+            if normalized_pattern and constraints:
+                filters.append({
+                    "pattern": normalized_pattern,
+                    "raw_pattern": support_pattern,
+                    "constraints": constraints,
+                })
+
+        return filters
+
+    def _passes_navigation_time_filters(self, slot):
+        if not self.navigation_time_filters:
+            return True
+
+        support = _normalize(slot["support"])
+        matching_filters = [
+            rule for rule in self.navigation_time_filters
+            if rule["pattern"] in support
+        ]
+        if not matching_filters:
+            return True
+
+        rule = max(matching_filters, key=lambda r: len(r["pattern"]))
+        start, end = self._parse_slot_time_range(slot["time"])
+        if start is None:
+            return True
+
+        constraints = rule["constraints"]
+        if "start_after" in constraints and start < constraints["start_after"]:
+            return False
+        if "start_before" in constraints and start > constraints["start_before"]:
+            return False
+        if end is not None:
+            if "end_after" in constraints and end < constraints["end_after"]:
+                return False
+            if "end_before" in constraints and end > constraints["end_before"]:
+                return False
+
+        return True
 
     def _load_config(self, path):
         config = configparser.ConfigParser()
@@ -560,6 +652,10 @@ class SailingBot:
             s for s in available
             if self._within_days_ahead(s["date"], self.navigation_days_ahead)
         ]
+        available = [
+            s for s in available
+            if self._passes_navigation_time_filters(s)
+        ]
 
         seen_in_pass = set()
         deduped = []
@@ -692,6 +788,11 @@ class SailingBot:
             self.log.info(f"Navigation libre lookahead: {self.navigation_days_ahead} day(s)")
             if self.filter_navigation_supports:
                 self.log.info(f"Navigation libre support filter: {', '.join(self.filter_navigation_supports)}")
+            if self.navigation_time_filters:
+                self.log.info(
+                    "Navigation libre time filters: "
+                    + ", ".join(rule["raw_pattern"] for rule in self.navigation_time_filters)
+                )
 
         if not self.login():
             self.log.critical("Initial login failed. Check your credentials in config.ini.")

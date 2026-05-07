@@ -60,6 +60,12 @@ html_dump_file = navigation_libre_authenticated.html
 [navigation_libre_filters]
 days_ahead = 21   # how many days ahead to check Navigation libre
 supports =        # e.g. Catamaran, Dériveur double (empty = all)
+
+[navigation_libre_time_filters]
+# Optional per-boat/support rules. Keys are partial matches.
+# after/before filter slot start time; end_before/end_after filter slot end time.
+# catamaran = after 17:00
+# hobie cat 18 = after 12:00, before 18:00
 ```
 
 > `config.ini` is gitignored and will never be pushed.
@@ -105,6 +111,20 @@ python bot.py --inspect-navigation-libre
 ```
 
 This logs in, fetches `https://sport.unil.ch/?pid=80&aid=92`, and saves the HTML to `navigation_libre_authenticated.html`.
+
+### Navigation libre time filters
+
+Add optional rules under `[navigation_libre_time_filters]` when different boats need different time windows:
+
+```ini
+[navigation_libre_time_filters]
+catamaran = after 17:00
+hobie cat 18 = after 12:00, before 18:00
+laser simple = before 12:00
+rs aero = after 09:00, end_before 18:00
+```
+
+The key is matched case-insensitively and accent-insensitively against the full support name. If multiple keys match a slot, the most specific key wins.
 
 ## Notifications
 

@@ -48,3 +48,14 @@ days_ahead = 21
 ; Comma-separated list of supports/boats to watch (leave empty = all)
 ; Examples: Catamaran, Dériveur simple, Dériveur double, Planche à voile, SUP, Kayak
 supports =
+
+[navigation_libre_time_filters]
+; Optional per-boat/support time filters.
+; The key is a case/accent-insensitive partial match against the full support name.
+; If several keys match the same slot, the most specific (longest) key is used.
+; after/before filter the slot start time. Use end_before/end_after for the end time.
+; Examples:
+; catamaran = after 17:00
+; hobie cat 18 = after 12:00, before 18:00
+; laser simple = before 12:00
+; rs aero = after 09:00, end_before 18:00
