@@ -5,6 +5,7 @@ Monitors the [UNIL/EPFL Centre Nautique](https://www2.unil.ch/sportres/nautique/
 ## Features
 
 - Checks course availability across the current week + next 3 weeks
+- Can also monitor “Navigation libre” reservation slots from `sport.unil.ch`
 - Notifies only when a **new** slot appears (no spam on every poll)
 - Filter by course type and/or instructor
 - Sends a **heartbeat message every 8 hours** so you know the bot is still running
@@ -46,6 +47,17 @@ log_file = sailing_bot.log
 [filters]
 course_types =    # e.g. Catamaran, Dériveur simple  (empty = all)
 instructors =     # e.g. Marine, Gaël               (empty = all)
+
+[navigation_libre]
+enabled = false
+login = your_navigation_libre_login_here
+password = your_navigation_libre_password_here
+activity_url = https://sport.unil.ch/?pid=80&aid=92
+login_url = https://sport.unil.ch/?pid=29
+html_dump_file = navigation_libre_authenticated.html
+
+[navigation_libre_filters]
+supports =        # e.g. Catamaran, Dériveur double (empty = all)
 ```
 
 > `config.ini` is gitignored and will never be pushed.
@@ -73,6 +85,22 @@ instructors = Marine
 ```
 
 Leave a filter empty to receive notifications for all courses / all instructors.
+
+## Navigation libre
+
+UNIL uses a separate account for the `sport.unil.ch` “Navigation libre” reservations. Fill the `[navigation_libre]` login/password with that account and set:
+
+```ini
+enabled = true
+```
+
+Before running the monitor, you can inspect the authenticated page structure:
+
+```bash
+python bot.py --inspect-navigation-libre
+```
+
+This logs in, fetches `https://sport.unil.ch/?pid=80&aid=92`, and saves the HTML to `navigation_libre_authenticated.html`.
 
 ## Notifications
 

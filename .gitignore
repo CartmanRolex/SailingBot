@@ -5,3 +5,4 @@ __pycache__/
 .env
 .venv/
 venv/
+navigation_libre_authenticated.html

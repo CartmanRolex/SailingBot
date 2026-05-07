@@ -25,3 +25,22 @@ course_types =
 ; Comma-separated list of instructors to watch (leave empty = all instructors)
 ; Partial matches work, e.g. "Mar" matches "Marine"
 instructors =
+
+[navigation_libre]
+; Set to true after filling the separate sport.unil.ch account credentials below
+enabled = false
+; Login for sport.unil.ch > Mon compte (Navigation libre reservations)
+login = your_navigation_libre_login_here
+; Password for the sport.unil.ch account
+password = your_navigation_libre_password_here
+; Activity page for Navigation libre slots
+activity_url = https://sport.unil.ch/?pid=80&aid=92
+; Login page for sport.unil.ch
+login_url = https://sport.unil.ch/?pid=29
+; Where --inspect-navigation-libre saves authenticated HTML
+html_dump_file = navigation_libre_authenticated.html
+
+[navigation_libre_filters]
+; Comma-separated list of supports/boats to watch (leave empty = all)
+; Examples: Catamaran, Dériveur simple, Dériveur double, Planche à voile, SUP, Kayak
+supports =
