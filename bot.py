@@ -136,6 +136,35 @@ class SailingBot:
             return True
         return date.today() <= slot_date <= date.today() + timedelta(days=days_ahead)
 
+    def _format_short_date(self, raw_date):
+        slot_date = self._parse_slot_date(raw_date)
+        if slot_date is None:
+            return raw_date
+
+        weekdays = ["lun", "mar", "mer", "jeu", "ven", "sam", "dim"]
+        return f"{weekdays[slot_date.weekday()]} {slot_date.strftime('%d.%m.%Y')}"
+
+    def _group_slots_by_date(self, slots):
+        grouped = []
+        index_by_date = {}
+        for slot in slots:
+            raw_date = slot["date"]
+            if raw_date not in index_by_date:
+                index_by_date[raw_date] = len(grouped)
+                grouped.append((raw_date, []))
+            grouped[index_by_date[raw_date]][1].append(slot)
+        return grouped
+
+    def _short_navigation_support(self, support):
+        parts = [part.strip() for part in support.split("/") if part.strip()]
+        drop = {"navigation libre", "centre nautique", "voile"}
+        kept = [part for part in parts if _normalize(part) not in drop]
+        if len(kept) >= 2:
+            return " · ".join(kept[:2])
+        if kept:
+            return kept[0]
+        return support
+
     def _parse_slot_time_range(self, raw_time):
         parts = re.findall(r"\d{1,2}:\d{2}", raw_time or "")
         if not parts:
@@ -704,27 +733,38 @@ class SailingBot:
         )
 
         if appeared and disappeared:
-            header = f"🔄 <b>Schedule changed</b> — {appeared} new, {disappeared} removed"
+            header = f"🔄 <b>Courses</b>\n{appeared} new · {disappeared} removed · {len(slots)} total"
         elif appeared:
-            header = f"🆕 <b>{appeared} new slot(s) appeared!</b>"
+            header = f"🆕 <b>Courses</b>\n{appeared} new · {len(slots)} total"
         elif disappeared:
-            header = f"❌ <b>{disappeared} slot(s) no longer available</b>"
+            header = f"❌ <b>Courses</b>\n{disappeared} removed · {len(slots)} total"
         else:
-            header = "ℹ️ <b>Schedule updated</b>"
+            header = f"ℹ️ <b>Courses</b>\n{len(slots)} total"
 
-        lines = [header, ""]
+        lines = [header]
         if slots:
-            lines.append(f"<b>All available slots ({len(slots)} total):</b>")
-            for slot in slots[:20]:
-                k = self._slot_key(slot)
-                line = (
-                    f"  📅 <b>{slot['date']}</b>  🕐 {slot['time']}\n"
-                    f"  ⛵ {slot['course']}  •  👤 {slot['instructor']}  •  🪑 {slot['enrollment']}"
-                )
-                if k in new_keys:
-                    line = f"<b>{line}</b>"
-                lines.append(line)
+            for raw_date, day_slots in self._group_slots_by_date(slots[:20]):
+                lines.append("")
+                lines.append(f"📅 <b>{escape(self._format_short_date(raw_date))}</b>")
+                for slot in day_slots:
+                    k = self._slot_key(slot)
+                    item_lines = [
+                        f"⏱ {escape(slot['time'])}",
+                        f"⛵ {escape(slot['course'])}",
+                    ]
+                    details = []
+                    if slot.get("instructor"):
+                        details.append(f"👤 {escape(slot['instructor'])}")
+                    if slot.get("enrollment"):
+                        details.append(f"🪑 {escape(slot['enrollment'])}")
+                    if details:
+                        item_lines.append(" · ".join(details))
+                    item = "\n".join(item_lines)
+                    if k in new_keys:
+                        item = f"<b>{item}</b>"
+                    lines.append(item)
         else:
+            lines.append("")
             lines.append("<i>No slots currently available.</i>")
 
         lines.append("")
@@ -739,29 +779,34 @@ class SailingBot:
         )
 
         if appeared and disappeared:
-            header = f"🔄 <b>Navigation libre changed</b> — {appeared} new, {disappeared} removed"
+            header = f"🔄 <b>Navigation libre</b>\n{appeared} new · {disappeared} removed · {len(slots)} total"
         elif appeared:
-            header = f"🧭 <b>{appeared} new navigation libre slot(s) appeared!</b>"
+            header = f"🧭 <b>Navigation libre</b>\n{appeared} new · {len(slots)} total"
         elif disappeared:
-            header = f"❌ <b>{disappeared} navigation libre slot(s) no longer available</b>"
+            header = f"❌ <b>Navigation libre</b>\n{disappeared} removed · {len(slots)} total"
         else:
-            header = "ℹ️ <b>Navigation libre updated</b>"
+            header = f"ℹ️ <b>Navigation libre</b>\n{len(slots)} total"
 
-        lines = [header, ""]
+        lines = [header]
         if slots:
-            lines.append(f"<b>All available navigation libre slots ({len(slots)} total):</b>")
-            for slot in slots[:25]:
-                k = self._navigation_slot_key(slot)
-                line = (
-                    f"  📅 <b>{escape(slot['date'])}</b>  🕐 {escape(slot['time'])}\n"
-                    f"  ⛵ {escape(slot['support'])}"
-                )
-                if slot.get("infos"):
-                    line += f"  •  {escape(slot['infos'])}"
-                if k in new_keys:
-                    line = f"<b>{line}</b>"
-                lines.append(line)
+            for raw_date, day_slots in self._group_slots_by_date(slots[:25]):
+                lines.append("")
+                lines.append(f"📅 <b>{escape(self._format_short_date(raw_date))}</b>")
+                for slot in day_slots:
+                    k = self._navigation_slot_key(slot)
+                    boat = self._short_navigation_support(slot["support"])
+                    item_lines = [
+                        f"⏱ {escape(slot['time'])}",
+                        f"⛵ {escape(boat)}",
+                    ]
+                    if slot.get("infos"):
+                        item_lines.append(escape(slot["infos"]))
+                    item = "\n".join(item_lines)
+                    if k in new_keys:
+                        item = f"<b>{item}</b>"
+                    lines.append(item)
         else:
+            lines.append("")
             lines.append("<i>No navigation libre slots currently available.</i>")
 
         lines.append("")
