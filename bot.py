@@ -8,6 +8,7 @@ import time
 import unicodedata
 from datetime import date, datetime, timedelta
 from html import escape
+import re
 from urllib.parse import urljoin
 
 import requests
@@ -48,6 +49,12 @@ def _looks_empty_or_placeholder(value):
     return not value or value.startswith("your_") or value.endswith("_here")
 
 
+def _config_int(config, section, option, fallback):
+    if not config.has_option(section, option):
+        return fallback
+    return config.getint(section, option)
+
+
 class SailingBot:
     def __init__(self, config_path=CONFIG_FILE):
         self.config = self._load_config(config_path)
@@ -60,6 +67,7 @@ class SailingBot:
         self.log_file = self.config["settings"]["log_file"]
         self.filter_courses = _parse_filter_list(self.config.get("filters", "course_types", fallback=""))
         self.filter_instructors = _parse_filter_list(self.config.get("filters", "instructors", fallback=""))
+        self.course_days_ahead = _config_int(self.config, "filters", "days_ahead", fallback=21)
         self.navigation_enabled = _config_bool(self.config, "navigation_libre", "enabled", fallback=False)
         self.navigation_login = self.config.get("navigation_libre", "login", fallback="")
         self.navigation_password = self.config.get("navigation_libre", "password", fallback="")
@@ -74,6 +82,9 @@ class SailingBot:
         )
         self.filter_navigation_supports = _parse_filter_list(
             self.config.get("navigation_libre_filters", "supports", fallback="")
+        )
+        self.navigation_days_ahead = _config_int(
+            self.config, "navigation_libre_filters", "days_ahead", fallback=21
         )
         self.log = self._setup_logging()
         self.session = requests.Session()
@@ -92,6 +103,25 @@ class SailingBot:
 
     def _navigation_slot_key(self, slot):
         return slot["href"] if slot.get("href") else f"{slot['date']}|{slot['support']}|{slot['time']}|{slot['planning_id']}"
+
+    def _parse_slot_date(self, raw_date):
+        match = re.search(r"(\d{1,2})\.(\d{1,2})\.(\d{2,4})", raw_date or "")
+        if not match:
+            return None
+
+        day, month, year = [int(part) for part in match.groups()]
+        if year < 100:
+            year += 2000
+        try:
+            return date(year, month, day)
+        except ValueError:
+            return None
+
+    def _within_days_ahead(self, raw_date, days_ahead):
+        slot_date = self._parse_slot_date(raw_date)
+        if slot_date is None:
+            return True
+        return date.today() <= slot_date <= date.today() + timedelta(days=days_ahead)
 
     def _load_config(self, path):
         config = configparser.ConfigParser()
@@ -397,10 +427,11 @@ class SailingBot:
         return available
 
     def check_availability(self):
-        # Check current week + next 3 weeks
         monday = date.today() - timedelta(days=date.today().weekday())
+        end_date = date.today() + timedelta(days=self.course_days_ahead)
+        weeks_to_fetch = ((end_date - monday).days // 7) + 1
         weeks = [None] + [
-            (monday + timedelta(weeks=i)).strftime("%Y%m%d") for i in range(1, 4)
+            (monday + timedelta(weeks=i)).strftime("%Y%m%d") for i in range(1, weeks_to_fetch)
         ]
 
         available = []
@@ -422,6 +453,10 @@ class SailingBot:
                 s for s in available
                 if any(f in _normalize(s["instructor"]) for f in self.filter_instructors)
             ]
+        available = [
+            s for s in available
+            if self._within_days_ahead(s["date"], self.course_days_ahead)
+        ]
 
         seen_in_pass = set()
         deduped = []
@@ -521,6 +556,10 @@ class SailingBot:
                 s for s in available
                 if any(f in _normalize(s["support"]) for f in self.filter_navigation_supports)
             ]
+        available = [
+            s for s in available
+            if self._within_days_ahead(s["date"], self.navigation_days_ahead)
+        ]
 
         seen_in_pass = set()
         deduped = []
@@ -552,10 +591,13 @@ class SailingBot:
         now = datetime.now().strftime("%d.%m.%Y %H:%M")
         lines = [
             f"💓 <b>Bot alive</b>  —  {now}",
-            f"📊 {len(slots)} course slot(s) currently available (next 3 weeks)",
+            f"📊 {len(slots)} course slot(s) currently available (next {self.course_days_ahead} day(s))",
         ]
         if navigation_slots is not None:
-            lines.append(f"🧭 {len(navigation_slots)} navigation libre slot(s) currently available")
+            lines.append(
+                f"🧭 {len(navigation_slots)} navigation libre slot(s) currently available "
+                f"(next {self.navigation_days_ahead} day(s))"
+            )
         return "\n".join(lines)
 
     def _format_update(self, slots, new_keys):
@@ -644,8 +686,10 @@ class SailingBot:
             self.log.info(f"Course filter: {', '.join(self.filter_courses)}")
         if self.filter_instructors:
             self.log.info(f"Instructor filter: {', '.join(self.filter_instructors)}")
+        self.log.info(f"Course lookahead: {self.course_days_ahead} day(s)")
         if self.navigation_enabled:
             self.log.info("Navigation libre monitoring enabled")
+            self.log.info(f"Navigation libre lookahead: {self.navigation_days_ahead} day(s)")
             if self.filter_navigation_supports:
                 self.log.info(f"Navigation libre support filter: {', '.join(self.filter_navigation_supports)}")
 

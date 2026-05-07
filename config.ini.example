@@ -19,6 +19,8 @@ course_url = https://www2.unil.ch/sportres/nautique/inscriptions.php
 log_file = sailing_bot.log
 
 [filters]
+; How many days ahead to check for course slots
+days_ahead = 21
 ; Comma-separated list of course types to watch (leave empty = all courses)
 ; Available types: Dériveur simple, Dériveur double, Catamaran, Entraînement à la régate
 course_types =
@@ -41,6 +43,8 @@ login_url = https://sport.unil.ch/?pid=29
 html_dump_file = navigation_libre_authenticated.html
 
 [navigation_libre_filters]
+; How many days ahead to check for Navigation libre slots
+days_ahead = 21
 ; Comma-separated list of supports/boats to watch (leave empty = all)
 ; Examples: Catamaran, Dériveur simple, Dériveur double, Planche à voile, SUP, Kayak
 supports =

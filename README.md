@@ -4,7 +4,7 @@ Monitors the [UNIL/EPFL Centre Nautique](https://www2.unil.ch/sportres/nautique/
 
 ## Features
 
-- Checks course availability across the current week + next 3 weeks
+- Checks course availability within a configurable lookahead window
 - Can also monitor “Navigation libre” reservation slots from `sport.unil.ch`
 - Notifies only when a **new** slot appears (no spam on every poll)
 - Filter by course type and/or instructor
@@ -45,6 +45,7 @@ course_url = https://www2.unil.ch/sportres/nautique/inscriptions.php
 log_file = sailing_bot.log
 
 [filters]
+days_ahead = 21   # how many days ahead to check courses
 course_types =    # e.g. Catamaran, Dériveur simple  (empty = all)
 instructors =     # e.g. Marine, Gaël               (empty = all)
 
@@ -57,6 +58,7 @@ login_url = https://sport.unil.ch/?pid=29
 html_dump_file = navigation_libre_authenticated.html
 
 [navigation_libre_filters]
+days_ahead = 21   # how many days ahead to check Navigation libre
 supports =        # e.g. Catamaran, Dériveur double (empty = all)
 ```
 
@@ -85,6 +87,8 @@ instructors = Marine
 ```
 
 Leave a filter empty to receive notifications for all courses / all instructors.
+
+`days_ahead` limits how far into the future the bot checks. Courses and Navigation libre have separate values, so you can monitor, for example, courses 21 days ahead but Navigation libre only 3 days ahead.
 
 ## Navigation libre
 
