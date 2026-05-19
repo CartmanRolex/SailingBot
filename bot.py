@@ -112,7 +112,7 @@ class SailingBot:
         self.windspots_enabled = _config_bool(self.config, "windspots", "enabled", fallback=False)
         self.windspots_station = self.config.get("windspots", "station", fallback="CHVD05")
         alert_knots = _config_int(self.config, "windspots", "alert_threshold_knots", fallback=7)
-        self.wind_alert_threshold_ms = alert_knots * 0.514444
+        self.wind_alert_threshold_kt = float(alert_knots)
         self.max_alerts_per_hour = _config_int(self.config, "windspots", "max_alerts_per_hour", fallback=2)
         self._wind_alert_times = []
         self._telegram_offset = 0
@@ -735,8 +735,8 @@ class SailingBot:
             if not sd:
                 return None
             return {
-                "speed_ms": float(sd.get("speed") or 0),
-                "gust_ms": float(sd.get("gust") or 0),
+                "speed_kmh": float(sd.get("speed") or 0),
+                "gust_kmh": float(sd.get("gust") or 0),
                 "direction": sd.get("direction", ""),
                 "direction_alpha": sd.get("directionAlpha", ""),
                 "temperature": sd.get("temperature", ""),
@@ -748,13 +748,13 @@ class SailingBot:
             return None
 
     @staticmethod
-    def _ms_to_knots(ms):
-        return ms * 1.94384
+    def _kmh_to_knots(kmh):
+        return kmh / 1.852
 
     def _wind_data_lines(self, data):
-        speed_kt = self._ms_to_knots(data["speed_ms"])
-        gust_kt = self._ms_to_knots(data["gust_ms"])
-        lines = [f"{speed_kt:.1f} kt ({data['speed_ms']:.1f} m/s) — gusts to {gust_kt:.1f} kt"]
+        speed_kt = self._kmh_to_knots(data["speed_kmh"])
+        gust_kt = self._kmh_to_knots(data["gust_kmh"])
+        lines = [f"{speed_kt:.1f} kt ({data['speed_kmh']:.1f} km/h) — gusts to {gust_kt:.1f} kt"]
         if data["direction_alpha"]:
             lines.append(f"Direction: {data['direction']}° {data['direction_alpha']}")
         parts = []
@@ -777,15 +777,13 @@ class SailingBot:
         data = self._fetch_wind()
         if data is None:
             return
-        if data["speed_ms"] >= self.wind_alert_threshold_ms and self._can_send_wind_alert():
+        speed_kt = self._kmh_to_knots(data["speed_kmh"])
+        if speed_kt >= self.wind_alert_threshold_kt and self._can_send_wind_alert():
             lines = [f"💨 <b>Wind alert!</b> Check it out — it's blowing at Dorigny!\n"]
             lines += self._wind_data_lines(data)
             self.send_telegram("\n".join(lines))
             self._wind_alert_times.append(time.time())
-            self.log.info(
-                f"Wind alert sent: {data['speed_ms']:.1f} m/s "
-                f"({self._ms_to_knots(data['speed_ms']):.1f} kt)"
-            )
+            self.log.info(f"Wind alert sent: {data['speed_kmh']:.1f} km/h ({speed_kt:.1f} kt)")
 
     def _handle_update(self, update):
         msg = update.get("message") or update.get("edited_message")
@@ -958,7 +956,7 @@ class SailingBot:
         if self.windspots_enabled:
             self.log.info(
                 f"Wind alerts enabled — station {self.windspots_station}, "
-                f"threshold {self._ms_to_knots(self.wind_alert_threshold_ms):.0f} kt, "
+                f"threshold {self.wind_alert_threshold_kt:.0f} kt, "
                 f"max {self.max_alerts_per_hour}/hour"
             )
 
