@@ -11,10 +11,13 @@ from html import escape
 import re
 from urllib.parse import urljoin
 
+import threading
+
 import requests
 from bs4 import BeautifulSoup
 
 CONFIG_FILE = "config.ini"
+WINDSPOTS_API = "https://api.windspots.org/mobile"
 LOGIN_URL = "https://www2.unil.ch/sportres/nautique/login.php"
 BASE_URL = "https://www2.unil.ch/sportres/nautique/"
 SPORT_BASE_URL = "https://sport.unil.ch/"
@@ -106,6 +109,14 @@ class SailingBot:
         self.navigation_session.headers.update({"User-Agent": "Mozilla/5.0 (compatible; SailingBot/1.0)"})
         self.form_action = LOGIN_URL
         self.navigation_form_action = self.navigation_login_url
+        self.windspots_enabled = _config_bool(self.config, "windspots", "enabled", fallback=False)
+        self.windspots_station = self.config.get("windspots", "station", fallback="CHVD05")
+        alert_knots = _config_int(self.config, "windspots", "alert_threshold_knots", fallback=7)
+        self.wind_alert_threshold_ms = alert_knots * 0.514444
+        self.max_alerts_per_hour = _config_int(self.config, "windspots", "max_alerts_per_hour", fallback=2)
+        self._wind_alert_times = []
+        self._telegram_offset = 0
+        self._stop_event = threading.Event()
         self._running = False
         self._prev_slot_keys = None
         self._prev_navigation_slot_keys = None
@@ -712,6 +723,104 @@ class SailingBot:
         except requests.RequestException as e:
             self.log.error(f"Telegram request error: {e}")
 
+    def _fetch_wind(self):
+        try:
+            resp = requests.get(
+                f"{WINDSPOTS_API}/stationdata",
+                params={"station": self.windspots_station, "duration": 1},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            sd = resp.json().get("stationData", {})
+            if not sd:
+                return None
+            return {
+                "speed_ms": float(sd.get("speed") or 0),
+                "gust_ms": float(sd.get("gust") or 0),
+                "direction": sd.get("direction", ""),
+                "direction_alpha": sd.get("directionAlpha", ""),
+                "temperature": sd.get("temperature", ""),
+                "water": sd.get("water", ""),
+                "last_update": sd.get("lastUpdate", ""),
+            }
+        except (requests.RequestException, ValueError, KeyError) as e:
+            self.log.error(f"Failed to fetch wind data: {e}")
+            return None
+
+    @staticmethod
+    def _ms_to_knots(ms):
+        return ms * 1.94384
+
+    def _wind_data_lines(self, data):
+        speed_kt = self._ms_to_knots(data["speed_ms"])
+        gust_kt = self._ms_to_knots(data["gust_ms"])
+        lines = [f"{speed_kt:.1f} kt ({data['speed_ms']:.1f} m/s) — gusts to {gust_kt:.1f} kt"]
+        if data["direction_alpha"]:
+            lines.append(f"Direction: {data['direction']}° {data['direction_alpha']}")
+        parts = []
+        if data["temperature"]:
+            parts.append(f"Air {data['temperature']}°C")
+        if data["water"]:
+            parts.append(f"Water {data['water']}°C")
+        if parts:
+            lines.append(" · ".join(parts))
+        return lines
+
+    def _can_send_wind_alert(self):
+        now = time.time()
+        self._wind_alert_times = [t for t in self._wind_alert_times if now - t < 3600]
+        return len(self._wind_alert_times) < self.max_alerts_per_hour
+
+    def _check_wind_alert(self):
+        if not self.windspots_enabled:
+            return
+        data = self._fetch_wind()
+        if data is None:
+            return
+        if data["speed_ms"] >= self.wind_alert_threshold_ms and self._can_send_wind_alert():
+            lines = [f"💨 <b>Wind alert!</b> Check it out — it's blowing at Dorigny!\n"]
+            lines += self._wind_data_lines(data)
+            self.send_telegram("\n".join(lines))
+            self._wind_alert_times.append(time.time())
+            self.log.info(
+                f"Wind alert sent: {data['speed_ms']:.1f} m/s "
+                f"({self._ms_to_knots(data['speed_ms']):.1f} kt)"
+            )
+
+    def _handle_update(self, update):
+        msg = update.get("message") or update.get("edited_message")
+        if not msg:
+            return
+        text = (msg.get("text") or "").strip().lower()
+        if not text.startswith("/wind"):
+            return
+        data = self._fetch_wind()
+        if data is None:
+            self.send_telegram("⚠️ Could not fetch wind data right now. Please try again later.")
+            return
+        lines = [f"🌊 <b>Dorigny — Centre Nautique</b>\n"]
+        lines += self._wind_data_lines(data)
+        if data["last_update"]:
+            lines.append(f"<i>Updated: {data['last_update']}</i>")
+        self.send_telegram("\n".join(lines))
+
+    def _poll_telegram_updates(self):
+        url = f"https://api.telegram.org/bot{self.bot_token}/getUpdates"
+        while not self._stop_event.is_set():
+            try:
+                resp = requests.get(
+                    url,
+                    params={"timeout": 30, "offset": self._telegram_offset},
+                    timeout=35,
+                )
+                if resp.ok:
+                    for update in resp.json().get("result", []):
+                        self._telegram_offset = update["update_id"] + 1
+                        self._handle_update(update)
+            except requests.RequestException as e:
+                self.log.error(f"Telegram getUpdates error: {e}")
+                self._stop_event.wait(5)
+
     def _format_heartbeat(self, slots, navigation_slots=None):
         now = datetime.now().strftime("%d.%m.%Y %H:%M")
         lines = [
@@ -821,6 +930,7 @@ class SailingBot:
         signal.signal(signal.SIGINT, self._shutdown)
         signal.signal(signal.SIGTERM, self._shutdown)
         self._running = True
+        self._stop_event.clear()
 
         self.log.info("SailingBot starting up")
         if self.filter_courses:
@@ -838,6 +948,19 @@ class SailingBot:
                     "Navigation libre time filters: "
                     + ", ".join(rule["raw_pattern"] for rule in self.navigation_time_filters)
                 )
+
+        update_thread = threading.Thread(
+            target=self._poll_telegram_updates, daemon=True, name="telegram-updates"
+        )
+        update_thread.start()
+        self.log.info("Telegram update listener started (use /wind to query wind conditions)")
+
+        if self.windspots_enabled:
+            self.log.info(
+                f"Wind alerts enabled — station {self.windspots_station}, "
+                f"threshold {self._ms_to_knots(self.wind_alert_threshold_ms):.0f} kt, "
+                f"max {self.max_alerts_per_hour}/hour"
+            )
 
         if not self.login():
             self.log.critical("Initial login failed. Check your credentials in config.ini.")
@@ -903,6 +1026,8 @@ class SailingBot:
 
                     self._prev_navigation_slot_keys = navigation_current_keys
 
+                self._check_wind_alert()
+
                 if time.time() - self._last_heartbeat >= 8 * 3600:
                     self.send_telegram(
                         self._format_heartbeat(
@@ -922,6 +1047,8 @@ class SailingBot:
                     break
                 time.sleep(1)
 
+        self._stop_event.set()
+        update_thread.join(timeout=40)
         self.log.info("SailingBot stopped.")
 
 

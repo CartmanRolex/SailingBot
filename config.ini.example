@@ -49,6 +49,16 @@ days_ahead = 21
 ; Examples: Catamaran, Dériveur simple, Dériveur double, Planche à voile, SUP, Kayak
 supports =
 
+[windspots]
+; Set to true to enable automatic wind alerts and the /wind Telegram command
+enabled = false
+; Windspots station ID (CHVD05 = Dorigny — Centre Nautique)
+station = CHVD05
+; Wind speed threshold to trigger an alert (in knots)
+alert_threshold_knots = 7
+; Maximum number of wind alerts to send per hour
+max_alerts_per_hour = 2
+
 [navigation_libre_time_filters]
 ; Optional per-boat/support time filters.
 ; The key is a case/accent-insensitive partial match against the full support name.
