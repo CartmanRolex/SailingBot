@@ -130,9 +130,34 @@ The key is matched case-insensitively and accent-insensitively against the full 
 
 | Event | Telegram message |
 |---|---|
-| New slot opens | 🚣 alert with date, time, course, instructor, places |
+| New slot opens | 🆕 alert listing **only the new** slot(s) |
+| Slot booked/expires | silence (query on demand with `/courses` or `/nav`) |
 | Nothing changed | silence |
+| Fetch failed (network) | silence — previous state kept, no false "removed/new" |
 | Every 8 hours | 💓 heartbeat with slot count |
+
+Alerts fire **only on newly-appeared slots**, never on removals, so messages stay
+actionable. State is persisted to `state.json`, so restarting the bot does **not**
+re-announce everything.
+
+## Telegram commands
+
+Send these to the bot in chat:
+
+| Command | Action |
+|---|---|
+| `/help` | List all commands |
+| `/status` | What's being monitored, filters, last counts, paused state |
+| `/courses` | Fetch & show current course slots **now** |
+| `/nav` | Fetch & show current Navigation libre slots **now** (is it still free?) |
+| `/wind` | Current wind at Dorigny |
+| `/pause` / `/resume` | Stop / resume all push alerts (persisted) |
+| `/watch <boat>` | Add a boat to the Navigation libre filter (e.g. `/watch RS aéro`) |
+| `/unwatch <boat>` | Remove a boat from the filter |
+| `/threshold <kt>` | Set the wind alert threshold |
+
+Settings changed via chat are saved to `state.json` and survive restarts; `config.ini`
+(with its comments) is never rewritten.
 
 ## Running as a systemd service
 
@@ -158,6 +183,8 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=/path/to/SailingBot
+# Optional: pin away from a faulty CPU core (see Troubleshooting below)
+# CPUAffinity=0-7 10-31
 ExecStart=/path/to/SailingBot/venv/bin/python /path/to/SailingBot/bot.py
 Restart=on-failure
 RestartSec=30
@@ -210,3 +237,39 @@ systemctl --user disable sailingbot
 > ```bash
 > systemctl --user restart sailingbot
 > ```
+
+## Troubleshooting
+
+### Random crashes / SEGV / "ASCII_SPACES" errors
+
+If the bot crash-loops with `Segmentation fault (core dumped)`, wrong results, or
+`AttributeError: 'str' object has no attribute 'ASCII_SPACES'`, this is **not** a bug
+in `bot.py` — it indicates a **faulty CPU core** corrupting any process scheduled on it.
+
+Diagnose by checking the kernel log for segfaults that all name the **same CPU**:
+
+```bash
+journalctl -k | grep -i segfault
+# e.g. every line says "... likely on CPU 8 (core 16, socket 0)"
+```
+
+Confirm which logical CPUs share that physical core:
+
+```bash
+cat /sys/devices/system/cpu/cpu8/topology/thread_siblings_list   # -> 8-9
+```
+
+Mitigate by pinning the service away from those CPUs in
+`~/.config/systemd/user/sailingbot.service`:
+
+```ini
+[Service]
+CPUAffinity=0-7 10-31     # all cores except the faulty 8 & 9
+```
+
+Then `systemctl --user daemon-reload && systemctl --user restart sailingbot`.
+For a permanent fix, run a memory/CPU test (e.g. `memtest86+`, `stress-ng --cpu`)
+and have the hardware serviced.
+
+> This bot currently runs in the conda env **`sailingbot`** (Python 3.13). The older
+> `bot` env used Python 3.14, whose Anaconda build was unstable on this machine.

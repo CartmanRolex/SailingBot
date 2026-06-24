@@ -1,7 +1,9 @@
 import configparser
 import argparse
+import json
 import logging
 import logging.handlers
+import os
 import signal
 import sys
 import time
@@ -14,6 +16,8 @@ from urllib.parse import urljoin
 import threading
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from bs4 import BeautifulSoup
 
 CONFIG_FILE = "config.ini"
@@ -80,6 +84,7 @@ class SailingBot:
         self.interval = int(self.config["settings"]["poll_interval_seconds"])
         self.course_url = self.config["settings"]["course_url"]
         self.log_file = self.config["settings"]["log_file"]
+        self.state_file = self.config.get("settings", "state_file", fallback="state.json")
         self.filter_courses = _parse_filter_list(self.config.get("filters", "course_types", fallback=""))
         self.filter_instructors = _parse_filter_list(self.config.get("filters", "instructors", fallback=""))
         self.course_days_ahead = _config_int(self.config, "filters", "days_ahead", fallback=21)
@@ -95,6 +100,13 @@ class SailingBot:
         self.navigation_html_dump_file = self.config.get(
             "navigation_libre", "html_dump_file", fallback="navigation_libre_authenticated.html"
         )
+        self.navigation_supports_raw = [
+            v.strip()
+            for v in self.config.get("navigation_libre_filters", "supports", fallback="").split(",")
+            if v.strip()
+        ]
+        # support_overrides (set via /watch /unwatch) replace the config list when non-None.
+        self.support_overrides = None
         self.filter_navigation_supports = _parse_filter_list(
             self.config.get("navigation_libre_filters", "supports", fallback="")
         )
@@ -103,10 +115,8 @@ class SailingBot:
         )
         self.navigation_time_filters = self._load_navigation_time_filters()
         self.log = self._setup_logging()
-        self.session = requests.Session()
-        self.session.headers.update({"User-Agent": "Mozilla/5.0 (compatible; SailingBot/1.0)"})
-        self.navigation_session = requests.Session()
-        self.navigation_session.headers.update({"User-Agent": "Mozilla/5.0 (compatible; SailingBot/1.0)"})
+        self.session = self._build_session()
+        self.navigation_session = self._build_session()
         self.form_action = LOGIN_URL
         self.navigation_form_action = self.navigation_login_url
         self.windspots_enabled = _config_bool(self.config, "windspots", "enabled", fallback=False)
@@ -121,12 +131,110 @@ class SailingBot:
         self._prev_slot_keys = None
         self._prev_navigation_slot_keys = None
         self._last_heartbeat = 0.0
+        self.paused = False
+        self._last_slot_count = 0
+        self._last_navigation_slot_count = 0
+        self._last_check_time = None
+        # Guards the shared sessions and mutable settings touched by both the
+        # poll loop and the Telegram command thread.
+        self._fetch_lock = threading.RLock()
+        self._load_state()
+
+    def _build_session(self):
+        """A requests session with automatic retry/backoff on transient failures."""
+        session = requests.Session()
+        session.headers.update({"User-Agent": "Mozilla/5.0 (compatible; SailingBot/1.0)"})
+        retry = Retry(
+            total=3,
+            connect=3,
+            read=3,
+            backoff_factor=1,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=frozenset({"GET", "POST"}),
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(max_retries=retry)
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        return session
+
+    def _state_path(self):
+        if os.path.isabs(self.state_file):
+            return self.state_file
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)), self.state_file)
+
+    def _apply_support_overrides(self):
+        """Recompute the effective normalized support filter from overrides or config."""
+        source = self.support_overrides if self.support_overrides is not None else self.navigation_supports_raw
+        self.filter_navigation_supports = [_normalize(v) for v in source if v.strip()]
+
+    def _load_state(self):
+        path = self._state_path()
+        try:
+            with open(path, encoding="utf-8") as f:
+                state = json.load(f)
+        except FileNotFoundError:
+            self._apply_support_overrides()
+            return
+        except (json.JSONDecodeError, OSError) as e:
+            self.log.warning(f"Could not read state file {path}: {e}; starting fresh.")
+            self._apply_support_overrides()
+            return
+
+        course_keys = state.get("course_slot_keys")
+        if course_keys is not None:
+            self._prev_slot_keys = set(course_keys)
+        nav_keys = state.get("nav_slot_keys")
+        if nav_keys is not None:
+            self._prev_navigation_slot_keys = set(nav_keys)
+        self._telegram_offset = state.get("telegram_offset", 0)
+        self.paused = bool(state.get("paused", False))
+        overrides = state.get("support_overrides")
+        self.support_overrides = list(overrides) if overrides is not None else None
+        if state.get("wind_threshold_kt") is not None:
+            self.wind_alert_threshold_kt = float(state["wind_threshold_kt"])
+        self._last_heartbeat = state.get("last_heartbeat", 0.0)
+        self._apply_support_overrides()
+        self.log.info(
+            f"Loaded state from {path} "
+            f"({len(self._prev_slot_keys or [])} course key(s), "
+            f"{len(self._prev_navigation_slot_keys or [])} nav key(s), "
+            f"paused={self.paused})"
+        )
+
+    def _save_state(self):
+        path = self._state_path()
+        state = {
+            "course_slot_keys": sorted(self._prev_slot_keys) if self._prev_slot_keys is not None else None,
+            "nav_slot_keys": sorted(self._prev_navigation_slot_keys) if self._prev_navigation_slot_keys is not None else None,
+            "telegram_offset": self._telegram_offset,
+            "paused": self.paused,
+            "support_overrides": self.support_overrides,
+            "wind_threshold_kt": self.wind_alert_threshold_kt,
+            "last_heartbeat": self._last_heartbeat,
+        }
+        tmp = f"{path}.tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(state, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, path)
+        except OSError as e:
+            self.log.error(f"Failed to save state file {path}: {e}")
 
     def _slot_key(self, slot):
         return slot["href"] if slot["href"] else f"{slot['date']}|{slot['time']}|{slot['course']}"
 
     def _navigation_slot_key(self, slot):
-        return slot["href"] if slot.get("href") else f"{slot['date']}|{slot['support']}|{slot['time']}|{slot['planning_id']}"
+        # Free-calendar blocks all share the activity URL and their time range
+        # shifts as the clock advances, so key them on boat+day+planning (one
+        # entry per boat/day) to avoid flapping. Inscription slots have a stable
+        # unique href.
+        if slot.get("planning_id"):
+            return f"{slot['date']}|{slot['support']}|{slot['planning_id']}"
+        href = slot.get("href") or ""
+        if href and href != self.navigation_url:
+            return href
+        return f"{slot['date']}|{slot['support']}|{slot['time']}"
 
     def _parse_slot_date(self, raw_date):
         match = re.search(r"(\d{1,2})\.(\d{1,2})\.(\d{2,4})", raw_date or "")
@@ -570,7 +678,10 @@ class SailingBot:
         for refdate in weeks:
             resp = self._fetch_week(refdate)
             if resp is None:
-                continue
+                # A failed fetch must not look like "everything disappeared".
+                # Abort this pass so the caller keeps the previous state.
+                self.log.warning("Course fetch failed this pass; skipping diff.")
+                return None
             soup = BeautifulSoup(resp.text, "lxml")
             available.extend(self._parse_week(soup))
 
@@ -709,7 +820,9 @@ class SailingBot:
     def check_navigation_libre_availability(self):
         resp = self._fetch_navigation_libre_page()
         if resp is None:
-            return []
+            # Distinguish fetch failure (None) from a genuinely empty page ([]).
+            self.log.warning("Navigation libre fetch failed this pass; skipping diff.")
+            return None
         soup = BeautifulSoup(resp.text, "lxml")
         return self._parse_navigation_libre_page(soup)
 
@@ -772,7 +885,7 @@ class SailingBot:
         return len(self._wind_alert_times) < self.max_alerts_per_hour
 
     def _check_wind_alert(self):
-        if not self.windspots_enabled:
+        if not self.windspots_enabled or self.paused:
             return
         data = self._fetch_wind()
         if data is None:
@@ -789,9 +902,78 @@ class SailingBot:
         msg = update.get("message") or update.get("edited_message")
         if not msg:
             return
-        text = (msg.get("text") or "").strip().lower()
-        if not text.startswith("/wind"):
+        text = (msg.get("text") or "").strip()
+        if not text.startswith("/"):
             return
+        parts = text.split()
+        command = parts[0].lower().split("@")[0]  # tolerate /cmd@BotName
+        args = parts[1:]
+
+        handlers = {
+            "/help": self._cmd_help,
+            "/start": self._cmd_help,
+            "/status": self._cmd_status,
+            "/wind": self._cmd_wind,
+            "/courses": self._cmd_courses,
+            "/nav": self._cmd_nav,
+            "/pause": self._cmd_pause,
+            "/resume": self._cmd_resume,
+            "/watch": self._cmd_watch,
+            "/unwatch": self._cmd_unwatch,
+            "/threshold": self._cmd_threshold,
+        }
+        handler = handlers.get(command)
+        if handler is None:
+            self.send_telegram("❓ Unknown command. Send /help for the list.")
+            return
+        try:
+            handler(args)
+        except Exception as e:
+            self.log.error(f"Error handling command {command}: {e}", exc_info=True)
+            self.send_telegram("⚠️ Something went wrong handling that command.")
+
+    def _cmd_help(self, args):
+        self.send_telegram(
+            "<b>SailingBot commands</b>\n"
+            "/status — what's being monitored\n"
+            "/courses — current course slots now\n"
+            "/nav — current navigation libre slots now\n"
+            "/wind — current wind at Dorigny\n"
+            "/pause — stop alerts\n"
+            "/resume — resume alerts\n"
+            "/watch &lt;boat&gt; — add a boat to the navigation libre filter\n"
+            "/unwatch &lt;boat&gt; — remove a boat from the filter\n"
+            "/threshold &lt;kt&gt; — set the wind alert threshold"
+        )
+
+    def _cmd_status(self, args):
+        lines = ["<b>SailingBot status</b>"]
+        lines.append("⏸️ Alerts: <b>paused</b>" if self.paused else "▶️ Alerts: <b>active</b>")
+        lines.append(f"⏱ Poll interval: {self.interval}s")
+        lines.append(f"📅 Course lookahead: {self.course_days_ahead} day(s)")
+        if self.filter_courses:
+            lines.append(f"⛵ Course filter: {', '.join(self.filter_courses)}")
+        if self.filter_instructors:
+            lines.append(f"👤 Instructor filter: {', '.join(self.filter_instructors)}")
+        if self.navigation_enabled:
+            supports = self.support_overrides if self.support_overrides is not None else self.navigation_supports_raw
+            lines.append(
+                f"🧭 Navigation libre: on · lookahead {self.navigation_days_ahead} day(s)"
+            )
+            lines.append(f"   Boats: {', '.join(supports) if supports else 'all'}")
+        else:
+            lines.append("🧭 Navigation libre: off")
+        if self.windspots_enabled:
+            lines.append(f"💨 Wind alert threshold: {self.wind_alert_threshold_kt:.0f} kt")
+        lines.append("")
+        last = self._last_check_time.strftime("%d.%m.%Y %H:%M") if self._last_check_time else "never"
+        lines.append(
+            f"📊 Last check ({last}): {self._last_slot_count} course slot(s)"
+            + (f", {self._last_navigation_slot_count} nav slot(s)" if self.navigation_enabled else "")
+        )
+        self.send_telegram("\n".join(lines))
+
+    def _cmd_wind(self, args):
         data = self._fetch_wind()
         if data is None:
             self.send_telegram("⚠️ Could not fetch wind data right now. Please try again later.")
@@ -801,6 +983,88 @@ class SailingBot:
         if data["last_update"]:
             lines.append(f"<i>Updated: {data['last_update']}</i>")
         self.send_telegram("\n".join(lines))
+
+    def _cmd_courses(self, args):
+        with self._fetch_lock:
+            slots = self.check_availability()
+        if slots is None:
+            self.send_telegram("⚠️ Could not fetch courses right now. Please try again later.")
+            return
+        self.send_telegram(self._format_course_list(slots))
+
+    def _cmd_nav(self, args):
+        if not self.navigation_enabled:
+            self.send_telegram("🧭 Navigation libre monitoring is disabled.")
+            return
+        with self._fetch_lock:
+            slots = self.check_navigation_libre_availability()
+        if slots is None:
+            self.send_telegram("⚠️ Could not fetch navigation libre right now. Please try again later.")
+            return
+        self.send_telegram(self._format_navigation_list(slots))
+
+    def _cmd_pause(self, args):
+        with self._fetch_lock:
+            self.paused = True
+            self._save_state()
+        self.send_telegram("⏸️ Alerts paused. Send /resume to turn them back on.")
+
+    def _cmd_resume(self, args):
+        with self._fetch_lock:
+            self.paused = False
+            self._save_state()
+        self.send_telegram("▶️ Alerts resumed.")
+
+    def _cmd_watch(self, args):
+        if not args:
+            self.send_telegram("Usage: /watch &lt;boat name&gt;  (e.g. /watch RS aéro)")
+            return
+        name = " ".join(args).strip()
+        with self._fetch_lock:
+            current = list(self.support_overrides) if self.support_overrides is not None else list(self.navigation_supports_raw)
+            if any(_normalize(name) == _normalize(c) for c in current):
+                self.send_telegram(f"⚠️ Already watching “{escape(name)}”.")
+                return
+            current.append(name)
+            self.support_overrides = current
+            self._apply_support_overrides()
+            self._save_state()
+        self.send_telegram(f"✅ Now watching: {escape(', '.join(current))}")
+
+    def _cmd_unwatch(self, args):
+        if not args:
+            self.send_telegram("Usage: /unwatch &lt;boat name&gt;")
+            return
+        name = " ".join(args).strip()
+        with self._fetch_lock:
+            current = list(self.support_overrides) if self.support_overrides is not None else list(self.navigation_supports_raw)
+            kept = [c for c in current if _normalize(c) != _normalize(name)]
+            if len(kept) == len(current):
+                self.send_telegram(f"⚠️ “{escape(name)}” was not in the watch list.")
+                return
+            self.support_overrides = kept
+            self._apply_support_overrides()
+            self._save_state()
+        self.send_telegram(
+            f"✅ Now watching: {escape(', '.join(kept)) if kept else 'all boats'}"
+        )
+
+    def _cmd_threshold(self, args):
+        if not args:
+            self.send_telegram(f"Current wind alert threshold: {self.wind_alert_threshold_kt:.0f} kt\nUsage: /threshold &lt;kt&gt;")
+            return
+        try:
+            value = float(args[0].replace(",", "."))
+        except ValueError:
+            self.send_telegram("⚠️ Please give a number, e.g. /threshold 10")
+            return
+        if value <= 0 or value > 100:
+            self.send_telegram("⚠️ Threshold must be between 1 and 100 kt.")
+            return
+        with self._fetch_lock:
+            self.wind_alert_threshold_kt = value
+            self._save_state()
+        self.send_telegram(f"✅ Wind alert threshold set to {value:.0f} kt.")
 
     def _poll_telegram_updates(self):
         url = f"https://api.telegram.org/bot{self.bot_token}/getUpdates"
@@ -812,113 +1076,147 @@ class SailingBot:
                     timeout=35,
                 )
                 if resp.ok:
-                    for update in resp.json().get("result", []):
+                    updates = resp.json().get("result", [])
+                    for update in updates:
                         self._telegram_offset = update["update_id"] + 1
                         self._handle_update(update)
+                    if updates:
+                        with self._fetch_lock:
+                            self._save_state()
             except requests.RequestException as e:
                 self.log.error(f"Telegram getUpdates error: {e}")
                 self._stop_event.wait(5)
 
-    def _format_heartbeat(self, slots, navigation_slots=None):
+    def _format_heartbeat(self):
         now = datetime.now().strftime("%d.%m.%Y %H:%M")
         lines = [
             f"💓 <b>Bot alive</b>  —  {now}",
-            f"📊 {len(slots)} course slot(s) currently available (next {self.course_days_ahead} day(s))",
+            f"📊 {self._last_slot_count} course slot(s) currently available (next {self.course_days_ahead} day(s))",
         ]
-        if navigation_slots is not None:
+        if self.navigation_enabled:
             lines.append(
-                f"🧭 {len(navigation_slots)} navigation libre slot(s) currently available "
+                f"🧭 {self._last_navigation_slot_count} navigation libre slot(s) currently available "
                 f"(next {self.navigation_days_ahead} day(s))"
             )
+        if self.paused:
+            lines.append("⏸️ <i>Alerts are paused (/resume to re-enable)</i>")
         return "\n".join(lines)
 
-    def _format_update(self, slots, new_keys):
-        appeared = len(new_keys)
-        disappeared = (
-            len(self._prev_slot_keys - {self._slot_key(s) for s in slots})
-            if self._prev_slot_keys is not None else 0
-        )
-
-        if appeared and disappeared:
-            header = f"🔄 <b>Courses</b>\n{appeared} new · {disappeared} removed · {len(slots)} total"
-        elif appeared:
-            header = f"🆕 <b>Courses</b>\n{appeared} new · {len(slots)} total"
-        elif disappeared:
-            header = f"❌ <b>Courses</b>\n{disappeared} removed · {len(slots)} total"
-        else:
-            header = f"ℹ️ <b>Courses</b>\n{len(slots)} total"
-
-        lines = [header]
-        if slots:
-            for raw_date, day_slots in self._group_slots_by_date(slots[:20]):
-                lines.append("")
-                lines.append(f"📅 <b>{escape(self._format_short_date(raw_date))}</b>")
-                for slot in day_slots:
-                    k = self._slot_key(slot)
-                    item_lines = [
-                        f"⏱ {escape(slot['time'])}",
-                        f"⛵ {escape(slot['course'])}",
-                    ]
-                    details = []
-                    if slot.get("instructor"):
-                        details.append(f"👤 {escape(slot['instructor'])}")
-                    if slot.get("enrollment"):
-                        details.append(f"🪑 {escape(slot['enrollment'])}")
-                    if details:
-                        item_lines.append(" · ".join(details))
-                    item = "\n".join(item_lines)
-                    if k in new_keys:
-                        item = f"<b>{item}</b>"
-                    lines.append(item)
-        else:
+    def _render_course_slot_lines(self, slots, limit=20):
+        lines = []
+        for raw_date, day_slots in self._group_slots_by_date(slots[:limit]):
             lines.append("")
-            lines.append("<i>No slots currently available.</i>")
+            lines.append(f"📅 <b>{escape(self._format_short_date(raw_date))}</b>")
+            for slot in day_slots:
+                item_lines = [
+                    f"⏱ {escape(slot['time'])}",
+                    f"⛵ {escape(slot['course'])}",
+                ]
+                details = []
+                if slot.get("instructor"):
+                    details.append(f"👤 {escape(slot['instructor'])}")
+                if slot.get("enrollment"):
+                    details.append(f"🪑 {escape(slot['enrollment'])}")
+                if details:
+                    item_lines.append(" · ".join(details))
+                lines.append("\n".join(item_lines))
+        if len(slots) > limit:
+            lines.append("")
+            lines.append(f"<i>… and {len(slots) - limit} more</i>")
+        return lines
 
+    def _render_navigation_slot_lines(self, slots, limit=25):
+        lines = []
+        for raw_date, day_slots in self._group_slots_by_date(slots[:limit]):
+            lines.append("")
+            lines.append(f"📅 <b>{escape(self._format_short_date(raw_date))}</b>")
+            for slot in day_slots:
+                boat = self._short_navigation_support(slot["support"])
+                item_lines = [
+                    f"⏱ {escape(slot['time'])}",
+                    f"⛵ {escape(boat)}",
+                ]
+                if slot.get("infos"):
+                    item_lines.append(escape(slot["infos"]))
+                lines.append("\n".join(item_lines))
+        if len(slots) > limit:
+            lines.append("")
+            lines.append(f"<i>… and {len(slots) - limit} more</i>")
+        return lines
+
+    def _format_update(self, new_slots, total):
+        lines = [f"🆕 <b>Courses</b> — {len(new_slots)} new · {total} available"]
+        lines += self._render_course_slot_lines(new_slots)
         lines.append("")
         lines.append(f'🔗 <a href="{self.course_url}">View &amp; register</a>')
         return "\n".join(lines)
 
-    def _format_navigation_update(self, slots, new_keys):
-        appeared = len(new_keys)
-        disappeared = (
-            len(self._prev_navigation_slot_keys - {self._navigation_slot_key(s) for s in slots})
-            if self._prev_navigation_slot_keys is not None else 0
-        )
-
-        if appeared and disappeared:
-            header = f"🔄 <b>Navigation libre</b>\n{appeared} new · {disappeared} removed · {len(slots)} total"
-        elif appeared:
-            header = f"🧭 <b>Navigation libre</b>\n{appeared} new · {len(slots)} total"
-        elif disappeared:
-            header = f"❌ <b>Navigation libre</b>\n{disappeared} removed · {len(slots)} total"
-        else:
-            header = f"ℹ️ <b>Navigation libre</b>\n{len(slots)} total"
-
-        lines = [header]
-        if slots:
-            for raw_date, day_slots in self._group_slots_by_date(slots[:25]):
-                lines.append("")
-                lines.append(f"📅 <b>{escape(self._format_short_date(raw_date))}</b>")
-                for slot in day_slots:
-                    k = self._navigation_slot_key(slot)
-                    boat = self._short_navigation_support(slot["support"])
-                    item_lines = [
-                        f"⏱ {escape(slot['time'])}",
-                        f"⛵ {escape(boat)}",
-                    ]
-                    if slot.get("infos"):
-                        item_lines.append(escape(slot["infos"]))
-                    item = "\n".join(item_lines)
-                    if k in new_keys:
-                        item = f"<b>{item}</b>"
-                    lines.append(item)
-        else:
-            lines.append("")
-            lines.append("<i>No navigation libre slots currently available.</i>")
-
+    def _format_navigation_update(self, new_slots, total):
+        lines = [f"🧭 <b>Navigation libre</b> — {len(new_slots)} new · {total} available"]
+        lines += self._render_navigation_slot_lines(new_slots)
         lines.append("")
         lines.append(f'🔗 <a href="{escape(self.navigation_url)}">View &amp; reserve</a>')
         return "\n".join(lines)
+
+    def _format_course_list(self, slots):
+        if not slots:
+            return "⛵ <b>Courses</b>\n\n<i>No course slots currently available.</i>"
+        lines = [f"⛵ <b>Courses</b> — {len(slots)} available"]
+        lines += self._render_course_slot_lines(slots)
+        lines.append("")
+        lines.append(f'🔗 <a href="{self.course_url}">View &amp; register</a>')
+        return "\n".join(lines)
+
+    def _format_navigation_list(self, slots):
+        if not slots:
+            return "🧭 <b>Navigation libre</b>\n\n<i>No slots currently available.</i>"
+        lines = [f"🧭 <b>Navigation libre</b> — {len(slots)} available"]
+        lines += self._render_navigation_slot_lines(slots)
+        lines.append("")
+        lines.append(f'🔗 <a href="{escape(self.navigation_url)}">View &amp; reserve</a>')
+        return "\n".join(lines)
+
+    def _process_course_slots(self, slots):
+        if slots is None:
+            return  # fetch failure already logged; keep previous state
+        self._last_slot_count = len(slots)
+        current_keys = {self._slot_key(s) for s in slots}
+        if self._prev_slot_keys is None:
+            # First data we've ever seen: adopt as baseline silently (no alert).
+            self.log.info(f"Course baseline established: {len(slots)} slot(s) (no alert)")
+            self._prev_slot_keys = current_keys
+            return
+        new_keys = current_keys - self._prev_slot_keys
+        removed_keys = self._prev_slot_keys - current_keys
+        self.log.info(
+            f"Course check: {len(slots)} available, {len(new_keys)} new, {len(removed_keys)} removed"
+        )
+        new_slots = [s for s in slots if self._slot_key(s) in new_keys]
+        if new_slots and not self.paused:
+            self.send_telegram(self._format_update(new_slots, len(slots)))
+            self.log.info(f"Telegram notification sent ({len(new_slots)} new course slot(s))")
+        self._prev_slot_keys = current_keys
+
+    def _process_navigation_slots(self, slots):
+        if slots is None:
+            return  # fetch failure already logged; keep previous state
+        self._last_navigation_slot_count = len(slots)
+        current_keys = {self._navigation_slot_key(s) for s in slots}
+        if self._prev_navigation_slot_keys is None:
+            self.log.info(f"Navigation libre baseline established: {len(slots)} slot(s) (no alert)")
+            self._prev_navigation_slot_keys = current_keys
+            return
+        new_keys = current_keys - self._prev_navigation_slot_keys
+        removed_keys = self._prev_navigation_slot_keys - current_keys
+        self.log.info(
+            f"Navigation libre check: {len(slots)} available, "
+            f"{len(new_keys)} new, {len(removed_keys)} removed"
+        )
+        new_slots = [s for s in slots if self._navigation_slot_key(s) in new_keys]
+        if new_slots and not self.paused:
+            self.send_telegram(self._format_navigation_update(new_slots, len(slots)))
+            self.log.info(f"Telegram notification sent ({len(new_slots)} new navigation libre slot(s))")
+        self._prev_navigation_slot_keys = current_keys
 
     def _shutdown(self, signum, frame):
         self.log.info("Shutdown signal received — stopping...")
@@ -951,7 +1249,7 @@ class SailingBot:
             target=self._poll_telegram_updates, daemon=True, name="telegram-updates"
         )
         update_thread.start()
-        self.log.info("Telegram update listener started (use /wind to query wind conditions)")
+        self.log.info("Telegram update listener started (send /help for commands)")
 
         if self.windspots_enabled:
             self.log.info(
@@ -972,69 +1270,27 @@ class SailingBot:
 
         while self._running:
             try:
-                slots = self.check_availability()
-                navigation_slots = []
-                if self.navigation_enabled:
-                    navigation_slots = self.check_navigation_libre_availability()
-                current_keys = {self._slot_key(s) for s in slots}
-
-                if self._prev_slot_keys is None:
-                    new_keys = current_keys
-                    changed = bool(current_keys)
-                    self.log.info(f"First check: {len(slots)} slot(s) available")
-                else:
-                    new_keys = current_keys - self._prev_slot_keys
-                    removed_keys = self._prev_slot_keys - current_keys
-                    changed = bool(new_keys or removed_keys)
-                    self.log.info(
-                        f"Check complete: {len(slots)} available, "
-                        f"{len(new_keys)} new, {len(removed_keys)} removed"
+                with self._fetch_lock:
+                    slots = self.check_availability()
+                    navigation_slots = (
+                        self.check_navigation_libre_availability()
+                        if self.navigation_enabled else []
                     )
 
-                if changed:
-                    message = self._format_update(slots, new_keys)
-                    self.send_telegram(message)
-                    self.log.info("Telegram notification sent (schedule changed)")
-
-                self._prev_slot_keys = current_keys
-
+                self._last_check_time = datetime.now()
+                self._process_course_slots(slots)
                 if self.navigation_enabled:
-                    navigation_current_keys = {
-                        self._navigation_slot_key(s) for s in navigation_slots
-                    }
-                    if self._prev_navigation_slot_keys is None:
-                        navigation_new_keys = navigation_current_keys
-                        navigation_changed = bool(navigation_current_keys)
-                        self.log.info(
-                            f"First navigation libre check: {len(navigation_slots)} slot(s)"
-                        )
-                    else:
-                        navigation_new_keys = navigation_current_keys - self._prev_navigation_slot_keys
-                        navigation_removed_keys = self._prev_navigation_slot_keys - navigation_current_keys
-                        navigation_changed = bool(navigation_new_keys or navigation_removed_keys)
-                        self.log.info(
-                            f"Navigation libre check complete: {len(navigation_slots)} available, "
-                            f"{len(navigation_new_keys)} new, {len(navigation_removed_keys)} removed"
-                        )
-
-                    if navigation_changed:
-                        message = self._format_navigation_update(navigation_slots, navigation_new_keys)
-                        self.send_telegram(message)
-                        self.log.info("Telegram notification sent (navigation libre changed)")
-
-                    self._prev_navigation_slot_keys = navigation_current_keys
+                    self._process_navigation_slots(navigation_slots)
 
                 self._check_wind_alert()
 
                 if time.time() - self._last_heartbeat >= 8 * 3600:
-                    self.send_telegram(
-                        self._format_heartbeat(
-                            slots,
-                            navigation_slots if self.navigation_enabled else None,
-                        )
-                    )
+                    self.send_telegram(self._format_heartbeat())
                     self._last_heartbeat = time.time()
                     self.log.info("Heartbeat sent")
+
+                with self._fetch_lock:
+                    self._save_state()
 
             except Exception as e:
                 self.log.error(f"Unexpected error during check: {e}", exc_info=True)
