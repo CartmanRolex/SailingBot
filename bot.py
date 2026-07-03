@@ -11,7 +11,7 @@ import unicodedata
 from datetime import date, datetime, timedelta
 from html import escape
 import re
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urldefrag
 
 import threading
 
@@ -74,6 +74,80 @@ def _parse_time_minutes(raw_time):
     return hour * 60 + minute
 
 
+_WEEKDAY_ALIASES = {
+    "lun": 0, "lundi": 0, "mon": 0, "monday": 0,
+    "mar": 1, "mardi": 1, "tue": 1, "tues": 1, "tuesday": 1,
+    "mer": 2, "mercredi": 2, "wed": 2, "wednesday": 2,
+    "jeu": 3, "jeudi": 3, "thu": 3, "thur": 3, "thurs": 3, "thursday": 3,
+    "ven": 4, "vendredi": 4, "fri": 4, "friday": 4,
+    "sam": 5, "samedi": 5, "sat": 5, "saturday": 5,
+    "dim": 6, "dimanche": 6, "sun": 6, "sunday": 6,
+}
+
+
+def _parse_day_token(token, today=None):
+    """Resolve a day token to a concrete date.
+
+    Accepts today/tomorrow (en+fr), weekday names (next occurrence, en+fr),
+    DD.MM[.YYYY] (rolls to next year if already past) and ISO YYYY-MM-DD.
+    """
+    today = today or date.today()
+    t = _normalize(token.strip())
+    if t in ("today", "auj", "aujourdhui"):
+        return today
+    if t in ("tomorrow", "demain", "tmrw", "tmr"):
+        return today + timedelta(days=1)
+    if t in _WEEKDAY_ALIASES:
+        delta = (_WEEKDAY_ALIASES[t] - today.weekday()) % 7
+        return today + timedelta(days=delta)
+
+    match = re.match(r"^(\d{1,2})[.\-/](\d{1,2})(?:[.\-/](\d{2,4}))?$", t)
+    if match:
+        day, month = int(match.group(1)), int(match.group(2))
+        raw_year = match.group(3)
+        if raw_year:
+            year = int(raw_year)
+            if year < 100:
+                year += 2000
+            try:
+                return date(year, month, day)
+            except ValueError:
+                return None
+        try:
+            candidate = date(today.year, month, day)
+        except ValueError:
+            return None
+        return candidate if candidate >= today else candidate.replace(year=today.year + 1)
+
+    match = re.match(r"^(\d{4})-(\d{1,2})-(\d{1,2})$", t)
+    if match:
+        try:
+            return date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+        except ValueError:
+            return None
+    return None
+
+
+def _parse_hour_token(token):
+    """Resolve an hour token to minutes-since-midnight, or the sentinel "any".
+
+    Returns None if the token is unparseable.
+    """
+    t = _normalize(token.strip())
+    if t in ("any", "all", "*", "toutes", "tout", "toute"):
+        return "any"
+    minutes = _parse_time_minutes(t)  # matches an embedded HH:MM (e.g. a range start)
+    if minutes is not None:
+        return minutes
+    match = re.match(r"^(\d{1,2})h?(\d{2})?$", t)
+    if match:
+        hour = int(match.group(1))
+        minute = int(match.group(2) or 0)
+        if hour <= 23 and minute <= 59:
+            return hour * 60 + minute
+    return None
+
+
 class SailingBot:
     def __init__(self, config_path=CONFIG_FILE):
         self.config = self._load_config(config_path)
@@ -113,6 +187,13 @@ class SailingBot:
         self.navigation_days_ahead = _config_int(
             self.config, "navigation_libre_filters", "days_ahead", fallback=21
         )
+        # Default partner name used to auto-register team boats (2-person supports).
+        # May be overridden at runtime via /partner; that override lives in state.json.
+        self.navigation_partner = self.config.get("navigation_libre", "partner", fallback="").strip()
+        if _looks_empty_or_placeholder(self.navigation_partner):
+            self.navigation_partner = ""
+        # Pending auto-registration requests (list of dicts); see _cmd_register.
+        self.registration_requests = []
         self.navigation_time_filters = self._load_navigation_time_filters()
         self.log = self._setup_logging()
         self.session = self._build_session()
@@ -194,6 +275,9 @@ class SailingBot:
         if state.get("wind_threshold_kt") is not None:
             self.wind_alert_threshold_kt = float(state["wind_threshold_kt"])
         self._last_heartbeat = state.get("last_heartbeat", 0.0)
+        self.registration_requests = state.get("registration_requests") or []
+        if state.get("navigation_partner") is not None:
+            self.navigation_partner = state["navigation_partner"]
         self._apply_support_overrides()
         self.log.info(
             f"Loaded state from {path} "
@@ -212,6 +296,8 @@ class SailingBot:
             "support_overrides": self.support_overrides,
             "wind_threshold_kt": self.wind_alert_threshold_kt,
             "last_heartbeat": self._last_heartbeat,
+            "registration_requests": self.registration_requests,
+            "navigation_partner": self.navigation_partner,
         }
         tmp = f"{path}.tmp"
         try:
@@ -826,6 +912,205 @@ class SailingBot:
         soup = BeautifulSoup(resp.text, "lxml")
         return self._parse_navigation_libre_page(soup)
 
+    def _parse_inscription_slots(self, soup):
+        """All Navigation libre inscription slots currently open on the page.
+
+        Unlike _parse_navigation_libre_page this ignores the monitoring filters
+        (support/time/days_ahead) — auto-registration must see every slot the
+        request could match, not just the ones being watched for alerts.
+        """
+        slots = []
+        for category in soup.select("dl.nav.calendar > dd > dl"):
+            title_el = category.find("dt", recursive=False)
+            slots_el = category.find("dd", recursive=False)
+            if not title_el or not slots_el:
+                continue
+            support = " ".join(title_el.get_text(" ", strip=True).split())
+            if "navigation libre" not in _normalize(support):
+                continue
+            for item in slots_el.select(".cours_items .item"):
+                link = item.select_one(".inscr a.btn_insc[href]")
+                if link is None:
+                    continue
+                date_el = item.select_one(".date .dt")
+                hour_el = item.select_one(".date .hour")
+                slots.append({
+                    "date": date_el.get_text(strip=True) if date_el else "",
+                    "support": support,
+                    "time": hour_el.get_text(" ", strip=True).replace("–", "-") if hour_el else "",
+                    "href": urljoin(SPORT_BASE_URL, link.get("href", "")),
+                })
+        return slots
+
+    def register_navigation_slot(self, href, partner=None):
+        """Attempt to register for one inscription slot.
+
+        Returns (ok, note, dtype) where dtype is "1" (solo) / "2" (team) / None.
+        note is "registered", "already registered", "needs partner", "full", or an
+        error description. See the reverse-engineered flow: the hidden `type` field
+        must be set from the availability button's data-type or the POST is ignored.
+        """
+        try:
+            resp = self.navigation_session.get(href, timeout=15)
+            resp.raise_for_status()
+        except requests.RequestException as e:
+            return False, f"fetch failed: {e}", None
+
+        soup = BeautifulSoup(resp.text, "lxml")
+        if soup.select_one("a[href*='a=remove']"):
+            return True, "already registered", None
+
+        button = soup.select_one("button.btn_insc[data-type]")
+        if button is None:
+            return False, "full", None
+        dtype = (button.get("data-type") or "").strip()
+
+        form = None
+        for candidate in soup.find_all("form"):
+            if candidate.find("input", {"name": "confirm_valid"}):
+                form = candidate
+                break
+        if form is None:
+            return False, "no inscription form", dtype
+
+        if dtype == "2" and not partner:
+            return False, "needs partner", dtype
+
+        payload = {}
+        for inp in form.find_all("input"):
+            name = inp.get("name")
+            if not name:
+                continue
+            input_type = (inp.get("type") or "text").lower()
+            if input_type == "checkbox":
+                if name == "confirm_valid":
+                    payload[name] = inp.get("value", "1")
+            elif name == "groupe_nom":
+                if dtype == "2":
+                    payload[name] = partner
+            elif name == "type":
+                payload[name] = dtype
+            else:
+                payload[name] = inp.get("value", "")
+        if dtype == "2" and "quantity" not in payload:
+            payload["quantity"] = "2"
+
+        post_url = urldefrag(resp.url)[0]
+        try:
+            post_resp = self.navigation_session.post(post_url, data=payload, timeout=20)
+            post_resp.raise_for_status()
+        except requests.RequestException as e:
+            return False, f"post failed: {e}", dtype
+
+        post_soup = BeautifulSoup(post_resp.text, "lxml")
+        ok = bool(post_soup.select_one("a[href*='a=remove']")) and not post_soup.find(
+            "input", {"name": "confirm_valid"}
+        )
+        return (True, "registered", dtype) if ok else (False, "submit rejected", dtype)
+
+    def _format_iso_day(self, iso):
+        try:
+            d = date.fromisoformat(iso)
+        except (ValueError, TypeError):
+            return iso
+        weekdays = ["lun", "mar", "mer", "jeu", "ven", "sam", "dim"]
+        return f"{weekdays[d.weekday()]} {d.strftime('%d.%m.%Y')}"
+
+    def _format_request(self, req):
+        boats = ", ".join(req.get("boats_label") or req.get("boats") or [])
+        hour = req["hour_label"] if req.get("hour_min") is not None else "any time"
+        return f"📅 {escape(self._format_iso_day(req['day']))} · ⏱ {escape(hour)} · ⛵ {escape(boats)}"
+
+    def _try_register_request(self, req, slots):
+        """Try to fulfil one request against the currently open slots.
+
+        Returns True if a slot was booked (request should be dropped). Sends the
+        success notification itself. Candidates are tried in boat-priority order,
+        then by start time, so the user's preferred boat wins.
+        """
+        candidates = []
+        for slot in slots:
+            slot_date = self._parse_slot_date(slot["date"])
+            if slot_date is None or slot_date.isoformat() != req["day"]:
+                continue
+            start, _ = self._parse_slot_time_range(slot["time"])
+            if req.get("hour_min") is not None and start != req["hour_min"]:
+                continue
+            support = _normalize(slot["support"])
+            priority = next((i for i, boat in enumerate(req["boats"]) if boat in support), None)
+            if priority is None:
+                continue
+            candidates.append((priority, start if start is not None else 9999, slot))
+
+        if not candidates:
+            return False
+        candidates.sort(key=lambda c: (c[0], c[1]))
+
+        for _, _, slot in candidates:
+            ok, note, dtype = self.register_navigation_slot(
+                slot["href"], partner=self.navigation_partner or None
+            )
+            if ok:
+                boat = self._short_navigation_support(slot["support"])
+                lines = [
+                    "✅ <b>Registered!</b>" if note == "registered"
+                    else "✅ <b>Already registered</b> for a matching slot",
+                    f"⛵ {escape(boat)}",
+                    f"📅 {escape(self._format_short_date(slot['date']))}  ⏱ {escape(slot['time'])}",
+                ]
+                if dtype == "2" and self.navigation_partner:
+                    lines.append(f"👥 with {escape(self.navigation_partner)}")
+                lines.append(f'\n🔗 <a href="{escape(self.navigation_url)}">View</a>')
+                self.send_telegram("\n".join(lines))
+                self.log.info(
+                    f"Auto-registered ({note}): {slot['support']} {slot['date']} {slot['time']}"
+                )
+                return True
+
+            if note == "needs partner":
+                if not req.get("warned_partner"):
+                    self.send_telegram(
+                        "⚠️ A matching slot is open but it's a <b>team boat</b> and no "
+                        "partner is set. Send /partner &lt;name&gt; and I'll grab it, or "
+                        "keep only solo boats in the request."
+                    )
+                    req["warned_partner"] = True
+                self.log.info(f"Skip team slot (no partner): {slot['support']} {slot['date']} {slot['time']}")
+            else:
+                self.log.info(
+                    f"Register attempt failed ({note}): {slot['support']} {slot['date']} {slot['time']}"
+                )
+        return False
+
+    def _process_registration_requests(self):
+        """Poll-loop hook: expire stale requests and try to fulfil the rest."""
+        with self._fetch_lock:
+            if not (self.navigation_enabled and self.registration_requests):
+                return
+            resp = self._fetch_navigation_libre_page()
+            if resp is None:
+                self.log.warning("Registration fetch failed this pass; will retry next cycle.")
+                return
+            slots = self._parse_inscription_slots(BeautifulSoup(resp.text, "lxml"))
+            today_iso = date.today().isoformat()
+            remaining = []
+            changed = False
+            for req in self.registration_requests:
+                if req["day"] < today_iso:
+                    self.send_telegram(
+                        f"⌛️ Registration request expired (no slot opened in time):\n{self._format_request(req)}"
+                    )
+                    self.log.info(f"Registration request expired: {req}")
+                    changed = True
+                    continue
+                if self._try_register_request(req, slots):
+                    changed = True
+                    continue
+                remaining.append(req)
+            if changed:
+                self.registration_requests = remaining
+                self._save_state()
+
     def send_telegram(self, message):
         url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
         payload = {"chat_id": self.chat_id, "text": message, "parse_mode": "HTML"}
@@ -921,6 +1206,10 @@ class SailingBot:
             "/watch": self._cmd_watch,
             "/unwatch": self._cmd_unwatch,
             "/threshold": self._cmd_threshold,
+            "/register": self._cmd_register,
+            "/requests": self._cmd_requests,
+            "/unregister": self._cmd_unregister,
+            "/partner": self._cmd_partner,
         }
         handler = handlers.get(command)
         if handler is None:
@@ -943,7 +1232,14 @@ class SailingBot:
             "/resume — resume alerts\n"
             "/watch &lt;boat&gt; — add a boat to the navigation libre filter\n"
             "/unwatch &lt;boat&gt; — remove a boat from the filter\n"
-            "/threshold &lt;kt&gt; — set the wind alert threshold"
+            "/threshold &lt;kt&gt; — set the wind alert threshold\n"
+            "\n<b>Auto-registration</b>\n"
+            "/register &lt;day&gt; &lt;hour&gt; &lt;boats&gt; — auto-sign-up for a nav libre slot\n"
+            "   e.g. <code>/register sat 10:00 RS aéro, Laser simple</code>\n"
+            "   day: today/tomorrow/sat/04.07 · hour: 10:00 or <code>any</code> · boats: comma-separated, priority order\n"
+            "/requests — list pending auto-registrations\n"
+            "/unregister &lt;n&gt; — cancel pending request number n\n"
+            "/partner &lt;name&gt; — set the partner name for team boats"
         )
 
     def _cmd_status(self, args):
@@ -961,6 +1257,10 @@ class SailingBot:
                 f"🧭 Navigation libre: on · lookahead {self.navigation_days_ahead} day(s)"
             )
             lines.append(f"   Boats: {', '.join(supports) if supports else 'all'}")
+            if self.registration_requests:
+                lines.append(f"🎯 Auto-register: {len(self.registration_requests)} pending (/requests)")
+            if self.navigation_partner:
+                lines.append(f"   Partner: {escape(self.navigation_partner)}")
         else:
             lines.append("🧭 Navigation libre: off")
         if self.windspots_enabled:
@@ -1065,6 +1365,112 @@ class SailingBot:
             self.wind_alert_threshold_kt = value
             self._save_state()
         self.send_telegram(f"✅ Wind alert threshold set to {value:.0f} kt.")
+
+    _REGISTER_USAGE = (
+        "Usage: /register &lt;day&gt; &lt;hour&gt; &lt;boats&gt;\n"
+        "e.g. <code>/register sat 10:00 RS aéro, Laser simple</code>\n"
+        "• day: today, tomorrow, a weekday (sat/samedi), 04.07 or 04.07.2026\n"
+        "• hour: a start time like 10:00, or <code>any</code> for any time that day\n"
+        "• boats: comma-separated, in priority order (I grab the first one that opens)"
+    )
+
+    def _parse_register_command(self, args):
+        """Parse /register args into a request dict. Returns (req, error_message)."""
+        if len(args) < 3:
+            return None, self._REGISTER_USAGE
+        day = _parse_day_token(args[0])
+        if day is None:
+            return None, f"⚠️ Couldn't read the day “{escape(args[0])}”.\n\n{self._REGISTER_USAGE}"
+        if day < date.today():
+            return None, f"⚠️ {escape(self._format_iso_day(day.isoformat()))} is in the past."
+        hour = _parse_hour_token(args[1])
+        if hour is None:
+            return None, f"⚠️ Couldn't read the hour “{escape(args[1])}”.\n\n{self._REGISTER_USAGE}"
+        boats_label = [b.strip() for b in " ".join(args[2:]).split(",") if b.strip()]
+        if not boats_label:
+            return None, f"⚠️ List at least one boat.\n\n{self._REGISTER_USAGE}"
+        hour_min = None if hour == "any" else hour
+        req = {
+            "day": day.isoformat(),
+            "hour_min": hour_min,
+            "hour_label": "any" if hour_min is None else f"{hour_min // 60:02d}:{hour_min % 60:02d}",
+            "boats": [_normalize(b) for b in boats_label],
+            "boats_label": boats_label,
+            "created": time.time(),
+        }
+        return req, None
+
+    def _cmd_register(self, args):
+        if not self.navigation_enabled:
+            self.send_telegram("🧭 Navigation libre is disabled; I can't auto-register.")
+            return
+        req, error = self._parse_register_command(args)
+        if error:
+            self.send_telegram(error)
+            return
+        with self._fetch_lock:
+            # Try immediately in case a matching slot is already open, otherwise arm it.
+            booked = False
+            resp = self._fetch_navigation_libre_page()
+            if resp is not None:
+                slots = self._parse_inscription_slots(BeautifulSoup(resp.text, "lxml"))
+                booked = self._try_register_request(req, slots)
+            if not booked:
+                self.registration_requests.append(req)
+                self._save_state()
+        if not booked:
+            self.send_telegram(
+                f"🎯 <b>Auto-register armed</b>\n{self._format_request(req)}\n\n"
+                "I'll grab the first matching slot the moment it opens and message you. "
+                "Send /requests to review or /unregister to cancel."
+            )
+
+    def _cmd_requests(self, args):
+        with self._fetch_lock:
+            reqs = list(self.registration_requests)
+        if not reqs:
+            self.send_telegram("🎯 No pending auto-registrations. Add one with /register.")
+            return
+        lines = [f"🎯 <b>Pending auto-registrations</b> — {len(reqs)}"]
+        for i, req in enumerate(reqs, 1):
+            lines.append(f"\n<b>{i}.</b> {self._format_request(req)}")
+        lines.append("\n<i>Cancel one with /unregister &lt;n&gt;</i>")
+        self.send_telegram("\n".join(lines))
+
+    def _cmd_unregister(self, args):
+        with self._fetch_lock:
+            count = len(self.registration_requests)
+            if not count:
+                self.send_telegram("🎯 No pending auto-registrations to cancel.")
+                return
+            if not args or not args[0].isdigit():
+                self.send_telegram(f"Usage: /unregister &lt;n&gt;  (1–{count}). See /requests.")
+                return
+            index = int(args[0])
+            if not 1 <= index <= count:
+                self.send_telegram(f"⚠️ No request #{index}. You have {count}. See /requests.")
+                return
+            removed = self.registration_requests.pop(index - 1)
+            self._save_state()
+        self.send_telegram(f"🗑️ Cancelled request:\n{self._format_request(removed)}")
+
+    def _cmd_partner(self, args):
+        if not args:
+            current = self.navigation_partner or "<i>none set</i>"
+            self.send_telegram(
+                f"👥 Team-boat partner: {escape(self.navigation_partner) if self.navigation_partner else current}\n"
+                "Set with /partner &lt;name&gt;, clear with /partner clear."
+            )
+            return
+        with self._fetch_lock:
+            if len(args) == 1 and args[0].lower() in ("clear", "none", "remove"):
+                self.navigation_partner = ""
+                self._save_state()
+                self.send_telegram("👥 Partner cleared. Team boats won't be auto-registered.")
+                return
+            self.navigation_partner = " ".join(args).strip()
+            self._save_state()
+        self.send_telegram(f"✅ Team-boat partner set to: {escape(self.navigation_partner)}")
 
     def _poll_telegram_updates(self):
         url = f"https://api.telegram.org/bot{self.bot_token}/getUpdates"
@@ -1244,6 +1650,10 @@ class SailingBot:
                     "Navigation libre time filters: "
                     + ", ".join(rule["raw_pattern"] for rule in self.navigation_time_filters)
                 )
+            if self.registration_requests:
+                self.log.info(f"Pending auto-registration requests: {len(self.registration_requests)}")
+            if self.navigation_partner:
+                self.log.info(f"Team-boat partner: {self.navigation_partner}")
 
         update_thread = threading.Thread(
             target=self._poll_telegram_updates, daemon=True, name="telegram-updates"
@@ -1281,6 +1691,7 @@ class SailingBot:
                 self._process_course_slots(slots)
                 if self.navigation_enabled:
                     self._process_navigation_slots(navigation_slots)
+                    self._process_registration_requests()
 
                 self._check_wind_alert()
 

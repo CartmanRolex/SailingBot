@@ -155,9 +155,40 @@ Send these to the bot in chat:
 | `/watch <boat>` | Add a boat to the Navigation libre filter (e.g. `/watch RS aéro`) |
 | `/unwatch <boat>` | Remove a boat from the filter |
 | `/threshold <kt>` | Set the wind alert threshold |
+| `/register <day> <hour> <boats>` | Auto-sign-up for a Navigation libre slot (see below) |
+| `/requests` | List pending auto-registrations |
+| `/unregister <n>` | Cancel pending request number `n` (from `/requests`) |
+| `/partner <name>` | Set the partner name used for team boats |
 
 Settings changed via chat are saved to `state.json` and survive restarts; `config.ini`
 (with its comments) is never rewritten.
+
+### Auto-registration
+
+`/register` signs you up for a **Navigation libre** slot automatically. If a matching
+slot is already open it books it immediately; otherwise it **arms** the request and the
+bot grabs the first matching slot the moment it opens, then messages you.
+
+```
+/register <day> <hour> <boat1, boat2, …>
+```
+
+- **day** — `today`, `tomorrow`, a weekday (`sat` / `samedi`), or a date (`04.07`, `04.07.2026`)
+- **hour** — a start time like `10:00`, or `any` for any time that day
+- **boats** — comma-separated, **in priority order**; the bot takes the first one that opens
+
+Examples:
+
+```
+/register sat 10:00 RS aéro, Laser simple
+/register tomorrow any Catamaran
+/register 12.07 14:00 Hobie Cat 18
+```
+
+**Team boats** (Hobie Cat 18, RS 16, Laser double) need a second sailor. Set the name once
+with `/partner <name>` (or the `partner =` key under `[navigation_libre]` in `config.ini`);
+solo boats (RS aéro, Laser simple) need no partner. A request is dropped after it books a
+slot, or when its day passes without one opening (you get a notification either way).
 
 ## Running as a systemd service
 

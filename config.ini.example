@@ -41,6 +41,10 @@ activity_url = https://sport.unil.ch/?pid=80&aid=92
 login_url = https://sport.unil.ch/?pid=29
 ; Where --inspect-navigation-libre saves authenticated HTML
 html_dump_file = navigation_libre_authenticated.html
+; Default partner name for auto-registering team boats (e.g. Hobie Cat 18, RS 16,
+; Laser double). Leave empty to only auto-register solo boats. Can also be set at
+; runtime with the /partner Telegram command.
+partner =
 
 [navigation_libre_filters]
 ; How many days ahead to check for Navigation libre slots
