@@ -155,9 +155,10 @@ Send these to the bot in chat:
 | `/watch <boat>` | Add a boat to the Navigation libre filter (e.g. `/watch RS aéro`) |
 | `/unwatch <boat>` | Remove a boat from the filter |
 | `/threshold <kt>` | Set the wind alert threshold |
-| `/register <day> <hour> <boats>` | Auto-sign-up for a Navigation libre slot (see below) |
-| `/requests` | List pending auto-registrations |
+| `/register [p1-9] <day> <hour> <boats>` | Auto-sign-up for a Navigation libre slot (see below) |
+| `/requests` | List pending auto-registrations and the current booking |
 | `/unregister <n>` | Cancel pending request number `n` (from `/requests`) |
+| `/unregister booking` | Cancel the current booking on the site |
 | `/partner <name>` | Set the partner name used for team boats |
 
 Settings changed via chat are saved to `state.json` and survive restarts; `config.ini`
@@ -170,25 +171,40 @@ slot is already open it books it immediately; otherwise it **arms** the request 
 bot grabs the first matching slot the moment it opens, then messages you.
 
 ```
-/register <day> <hour> <boat1, boat2, …>
+/register [p1-p9] <day> <hour> <boat1, boat2, …>
 ```
 
+- **p1–p9** — optional priority, `p1` = most wanted (default `p5`)
 - **day** — `today`, `tomorrow`, a weekday (`sat` / `samedi`), or a date (`04.07`, `04.07.2026`)
 - **hour** — a start time like `10:00`, or `any` for any time that day
-- **boats** — comma-separated, **in priority order**; the bot takes the first one that opens
+- **boats** — comma-separated **alternatives**; the bot takes the first one that opens
 
 Examples:
 
 ```
-/register sat 10:00 RS aéro, Laser simple
+/register p1 sat 10:00 RS aéro, Laser simple
 /register tomorrow any Catamaran
-/register 12.07 14:00 Hobie Cat 18
+/register p3 12.07 14:00 Hobie Cat 18
 ```
+
+**Priorities & upgrading.** sport.unil.ch allows only **one active booking at a time**.
+The bot always tries to hold the booking for your highest-priority (lowest `p`) fulfillable
+request: when a strictly higher-priority slot opens while a lesser booking is held, it
+cancels the current booking and registers the better slot in one go (with an immediate
+rollback to the old slot if the new registration unexpectedly fails). Lower-priority
+requests stay armed as fallbacks — e.g. book *anything Saturday afternoon* at `p5` while
+still gunning for *RS aéro at 16:00* at `p1`. Bookings made **by hand on the site** are
+detected too (the activity listing marks your booked slot with an *inscrit* link) and
+treated as lowest priority: any armed request replaces them when its slot opens — unless
+the booking is a team boat whose partner name the bot doesn't know (it could not restore
+it if the swap failed, so it leaves it alone). A booking whose slot has already started
+is never touched — the site refuses cancellations after the start anyway.
 
 **Team boats** (Hobie Cat 18, RS 16, Laser double) need a second sailor. Set the name once
 with `/partner <name>` (or the `partner =` key under `[navigation_libre]` in `config.ini`);
 solo boats (RS aéro, Laser simple) need no partner. A request is dropped after it books a
-slot, or when its day passes without one opening (you get a notification either way).
+slot (or an existing booking already covers it), or when its day passes without one opening
+(you get a notification either way).
 
 ## Running as a systemd service
 

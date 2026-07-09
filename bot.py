@@ -192,8 +192,13 @@ class SailingBot:
         self.navigation_partner = self.config.get("navigation_libre", "partner", fallback="").strip()
         if _looks_empty_or_placeholder(self.navigation_partner):
             self.navigation_partner = ""
-        # Pending auto-registration requests (list of dicts); see _cmd_register.
+        # Pending auto-registration requests (list of dicts, kept sorted by
+        # priority then creation time); see _cmd_register.
         self.registration_requests = []
+        # The one slot we're currently registered to (see
+        # _set_current_registration) or None. sport.unil.ch allows a single
+        # active registration at a time, so an upgrade must cancel this first.
+        self.current_registration = None
         self.navigation_time_filters = self._load_navigation_time_filters()
         self.log = self._setup_logging()
         self.session = self._build_session()
@@ -276,6 +281,10 @@ class SailingBot:
             self.wind_alert_threshold_kt = float(state["wind_threshold_kt"])
         self._last_heartbeat = state.get("last_heartbeat", 0.0)
         self.registration_requests = state.get("registration_requests") or []
+        for req in self.registration_requests:
+            req.setdefault("priority", 5)
+        self._sort_requests()
+        self.current_registration = state.get("current_registration")
         if state.get("navigation_partner") is not None:
             self.navigation_partner = state["navigation_partner"]
         self._apply_support_overrides()
@@ -297,6 +306,7 @@ class SailingBot:
             "wind_threshold_kt": self.wind_alert_threshold_kt,
             "last_heartbeat": self._last_heartbeat,
             "registration_requests": self.registration_requests,
+            "current_registration": self.current_registration,
             "navigation_partner": self.navigation_partner,
         }
         tmp = f"{path}.tmp"
@@ -608,6 +618,11 @@ class SailingBot:
         self.log.info(f"Navigation libre login successful (landed on: {post_resp.url})")
         return True
 
+    def _looks_logged_out(self, soup):
+        return bool(soup.find("input", {"type": "password"})) or "Se connecter" in soup.get_text(
+            " ", strip=True
+        )
+
     def _fetch_navigation_libre_page(self):
         try:
             resp = self.navigation_session.get(self.navigation_url, timeout=15)
@@ -617,7 +632,7 @@ class SailingBot:
             return None
 
         soup = BeautifulSoup(resp.text, "lxml")
-        if soup.find("input", {"type": "password"}) or "Se connecter" in soup.get_text(" ", strip=True):
+        if self._looks_logged_out(soup):
             self.log.warning("Navigation libre session expired or not authenticated; re-logging in...")
             if not self.login_navigation_libre():
                 raise RuntimeError("Navigation libre re-login failed")
@@ -913,11 +928,17 @@ class SailingBot:
         return self._parse_navigation_libre_page(soup)
 
     def _parse_inscription_slots(self, soup):
-        """All Navigation libre inscription slots currently open on the page.
+        """All Navigation libre inscription slots on the page, plus our booking.
 
         Unlike _parse_navigation_libre_page this ignores the monitoring filters
         (support/time/days_ahead) — auto-registration must see every slot the
         request could match, not just the ones being watched for alerts.
+
+        Slots carry "registered": the slot we're booked on shows an
+        `a.in` "inscrit" link instead of the `a.btn_insc` one (that marker is
+        the ONLY place the site reveals the current booking — the account page
+        doesn't list Navigation libre bookings at all). "dtype" is "1"/"2"
+        (solo/team) read from the item's type icon, or None.
         """
         slots = []
         for category in soup.select("dl.nav.calendar > dd > dl"):
@@ -929,9 +950,16 @@ class SailingBot:
             if "navigation libre" not in _normalize(support):
                 continue
             for item in slots_el.select(".cours_items .item"):
+                registered = False
                 link = item.select_one(".inscr a.btn_insc[href]")
                 if link is None:
-                    continue
+                    link = item.select_one(".inscr a.in[href]")
+                    registered = link is not None
+                if link is None:
+                    continue  # "complet" — no capacity and not ours
+                type_img = item.select_one(".type img[alt]")
+                type_alt = _normalize(type_img.get("alt", "")) if type_img else ""
+                dtype = "2" if "equipe" in type_alt else ("1" if "individuel" in type_alt else None)
                 date_el = item.select_one(".date .dt")
                 hour_el = item.select_one(".date .hour")
                 slots.append({
@@ -939,6 +967,8 @@ class SailingBot:
                     "support": support,
                     "time": hour_el.get_text(" ", strip=True).replace("–", "-") if hour_el else "",
                     "href": urljoin(SPORT_BASE_URL, link.get("href", "")),
+                    "registered": registered,
+                    "dtype": dtype,
                 })
         return slots
 
@@ -946,7 +976,8 @@ class SailingBot:
         """Attempt to register for one inscription slot.
 
         Returns (ok, note, dtype) where dtype is "1" (solo) / "2" (team) / None.
-        note is "registered", "already registered", "needs partner", "full", or an
+        note is "registered", "already registered", "needs partner", "full",
+        "quota" (blocked by the account's existing active registration), or an
         error description. See the reverse-engineered flow: the hidden `type` field
         must be set from the availability button's data-type or the POST is ignored.
         """
@@ -957,11 +988,21 @@ class SailingBot:
             return False, f"fetch failed: {e}", None
 
         soup = BeautifulSoup(resp.text, "lxml")
+        if self._looks_logged_out(soup):
+            # An expired session must not be mistaken for "full": the poll
+            # loop's page fetch re-logs in, so the next pass will see truth.
+            return False, "not logged in", None
         if soup.select_one("a[href*='a=remove']"):
             return True, "already registered", None
 
         button = soup.select_one("button.btn_insc[data-type]")
         if button is None:
+            scope = soup.select_one("#inscriptions") or soup
+            if "quota" in _normalize(scope.get_text(" ", strip=True)):
+                # "Quota d'inscription(s) active(s) atteint": the account already
+                # holds an active registration (only one allowed at a time), so
+                # EVERY other slot is blocked — not just this one.
+                return False, "quota", None
             return False, "full", None
         dtype = (button.get("data-type") or "").strip()
 
@@ -1019,17 +1060,167 @@ class SailingBot:
     def _format_request(self, req):
         boats = ", ".join(req.get("boats_label") or req.get("boats") or [])
         hour = req["hour_label"] if req.get("hour_min") is not None else "any time"
-        return f"📅 {escape(self._format_iso_day(req['day']))} · ⏱ {escape(hour)} · ⛵ {escape(boats)}"
+        return (
+            f"[p{req.get('priority', 5)}] 📅 {escape(self._format_iso_day(req['day']))}"
+            f" · ⏱ {escape(hour)} · ⛵ {escape(boats)}"
+        )
 
-    def _try_register_request(self, req, slots):
-        """Try to fulfil one request against the currently open slots.
+    def _format_registration(self, reg):
+        boat = self._short_navigation_support(reg.get("support") or "?")
+        text = (
+            f"⛵ {escape(boat)} · 📅 {escape(self._format_iso_day(reg.get('day') or '?'))}"
+            f" · ⏱ {escape(reg.get('time') or '?')}"
+        )
+        if reg.get("priority") is not None:
+            text += f" · p{reg['priority']}"
+        return text
 
-        Returns True if a slot was booked (request should be dropped). Sends the
-        success notification itself. Candidates are tried in boat-priority order,
-        then by start time, so the user's preferred boat wins.
+    def _sort_requests(self):
+        self.registration_requests.sort(
+            key=lambda r: (r.get("priority", 5), r.get("created", 0))
+        )
+
+    def _registration_times(self, reg):
+        """(start, end) datetimes of a booking; either may be None if unparseable."""
+        try:
+            day = date.fromisoformat(reg.get("day", ""))
+        except (TypeError, ValueError):
+            return None, None
+        midnight = datetime.combine(day, datetime.min.time())
+        start_min, end_min = self._parse_slot_time_range(reg.get("time", ""))
+        start = midnight + timedelta(minutes=start_min) if start_min is not None else None
+        end = midnight + timedelta(minutes=end_min) if end_min is not None else None
+        return start, end
+
+    def _slot_status(self, href):
+        """Probe one slot's rid page (read-only GET).
+
+        Returns (status, dtype, soup). status is one of:
+          "registered" — this booking is ours (remove link present)
+          "open"       — inscription button present, can register
+          "quota"      — blocked: the account already holds an active registration
+          "closed"     — full or not open (no button, no quota message)
+          "error"      — fetch failed (soup is None)
+        dtype is "1" (solo) / "2" (team) when determinable — from the button, or
+        from the "Type Individuel/Equipes" text that stays visible even when the
+        inscription form is hidden by the quota.
         """
+        try:
+            resp = self.navigation_session.get(href, timeout=15)
+            resp.raise_for_status()
+        except requests.RequestException as e:
+            self.log.warning(f"Slot status fetch failed ({href}): {e}")
+            return "error", None, None
+        soup = BeautifulSoup(resp.text, "lxml")
+        if self._looks_logged_out(soup):
+            # Session expired: a login page has no remove link / button, which
+            # must read as "don't know", never as "closed" or "cancelled".
+            self.log.warning(f"Slot status probe hit the login page ({href})")
+            return "error", None, None
+        scope = soup.select_one("#inscriptions") or soup
+        text = _normalize(scope.get_text(" ", strip=True))
+        button = soup.select_one("button.btn_insc[data-type]")
+        dtype = None
+        if button is not None:
+            dtype = (button.get("data-type") or "").strip() or None
+        elif "type equipes" in text:
+            dtype = "2"
+        elif "type individuel" in text:
+            dtype = "1"
+        if soup.select_one("a[href*='a=remove']"):
+            return "registered", dtype, soup
+        if button is not None:
+            return "open", dtype, soup
+        if "quota" in text:
+            return "quota", dtype, soup
+        return "closed", dtype, soup
+
+    def cancel_navigation_slot(self, href):
+        """Cancel our booking on one slot. Returns (ok, note).
+
+        Idempotent: cancelling a slot we're not booked on returns
+        (True, "not registered"). The site refuses cancellation once the slot
+        has started — that surfaces as (False, "still registered after removal").
+        """
+        try:
+            resp = self.navigation_session.get(href, timeout=15)
+            resp.raise_for_status()
+        except requests.RequestException as e:
+            return False, f"fetch failed: {e}"
+        soup = BeautifulSoup(resp.text, "lxml")
+        if self._looks_logged_out(soup):
+            return False, "not logged in"
+        remove_link = soup.select_one("a[href*='a=remove']")
+        if remove_link is None:
+            return True, "not registered"
+        remove_url = urldefrag(urljoin(resp.url, remove_link.get("href", "")))[0]
+        try:
+            confirm = self.navigation_session.get(remove_url, timeout=15)
+            confirm.raise_for_status()
+        except requests.RequestException as e:
+            return False, f"remove failed: {e}"
+        status, _, _ = self._slot_status(href)
+        if status == "registered":
+            return False, "still registered after removal"
+        self.log.info(f"Cancelled booking: {href}")
+        return True, "cancelled"
+
+    def _set_current_registration(self, slot, req=None, dtype=None):
+        slot_date = self._parse_slot_date(slot["date"])
+        self.current_registration = {
+            "href": slot["href"],
+            "day": slot_date.isoformat() if slot_date else str(slot.get("date", "")),
+            "time": slot.get("time", ""),
+            "support": slot.get("support", ""),
+            # None = booking made outside the bot: any armed request outranks it.
+            "priority": req.get("priority", 5) if req is not None else None,
+            "partner": (self.navigation_partner or "") if dtype == "2" else "",
+            "dtype": dtype,
+            "registered_at": time.time(),
+        }
+
+    def _notify_registered(self, slot, note, dtype, replaced=None):
+        boat = self._short_navigation_support(slot["support"])
+        if replaced is not None:
+            head = "🔁 <b>Upgraded booking!</b>"
+        elif note == "already registered":
+            head = "✅ <b>Already registered</b> for a matching slot"
+        else:
+            head = "✅ <b>Registered!</b>"
+        lines = [
+            head,
+            f"⛵ {escape(boat)}",
+            f"📅 {escape(self._format_short_date(slot['date']))}  ⏱ {escape(slot['time'])}",
+        ]
+        if dtype == "2" and self.navigation_partner:
+            lines.append(f"👥 with {escape(self.navigation_partner)}")
+        if replaced is not None:
+            lines.append(f"🗑️ cancelled: {self._format_registration(replaced)}")
+        lines.append(f'\n🔗 <a href="{escape(self.navigation_url)}">View</a>')
+        self.send_telegram("\n".join(lines))
+        self.log.info(
+            f"Auto-registered ({note}): {slot['support']} {slot['date']} {slot['time']}"
+            + (f" — replaced {replaced.get('support')} {replaced.get('day')}" if replaced else "")
+        )
+
+    def _warn_needs_partner(self, req, slot):
+        if not req.get("warned_partner"):
+            self.send_telegram(
+                "⚠️ A matching slot is open but it's a <b>team boat</b> and no "
+                "partner is set. Send /partner &lt;name&gt; and I'll grab it, or "
+                "keep only solo boats in the request."
+            )
+            req["warned_partner"] = True
+        self.log.info(
+            f"Skip team slot (no partner): {slot['support']} {slot['date']} {slot['time']}"
+        )
+
+    def _request_candidates(self, req, slots):
+        """Open slots matching one request, best first (boat order, then start)."""
         candidates = []
         for slot in slots:
+            if slot.get("registered"):
+                continue  # that's our current booking, not an open spot
             slot_date = self._parse_slot_date(slot["date"])
             if slot_date is None or slot_date.isoformat() != req["day"]:
                 continue
@@ -1037,79 +1228,301 @@ class SailingBot:
             if req.get("hour_min") is not None and start != req["hour_min"]:
                 continue
             support = _normalize(slot["support"])
-            priority = next((i for i, boat in enumerate(req["boats"]) if boat in support), None)
-            if priority is None:
+            rank = next((i for i, boat in enumerate(req["boats"]) if boat in support), None)
+            if rank is None:
                 continue
-            candidates.append((priority, start if start is not None else 9999, slot))
-
-        if not candidates:
-            return False
+            candidates.append((rank, start if start is not None else 9999, slot))
         candidates.sort(key=lambda c: (c[0], c[1]))
+        return [slot for _, _, slot in candidates]
 
-        for _, _, slot in candidates:
+    def _register_from_candidates(self, req, candidates, replaced=None):
+        """Try candidates best-first. Returns (booked_slot_or_None, quota_blocked).
+
+        On success also records current_registration and sends the notification
+        (worded as an upgrade when `replaced` is given). quota_blocked=True means
+        the account holds an active registration the site won't let us add to —
+        no point trying further slots.
+        """
+        for slot in candidates:
             ok, note, dtype = self.register_navigation_slot(
                 slot["href"], partner=self.navigation_partner or None
             )
             if ok:
-                boat = self._short_navigation_support(slot["support"])
-                lines = [
-                    "✅ <b>Registered!</b>" if note == "registered"
-                    else "✅ <b>Already registered</b> for a matching slot",
-                    f"⛵ {escape(boat)}",
-                    f"📅 {escape(self._format_short_date(slot['date']))}  ⏱ {escape(slot['time'])}",
-                ]
-                if dtype == "2" and self.navigation_partner:
-                    lines.append(f"👥 with {escape(self.navigation_partner)}")
-                lines.append(f'\n🔗 <a href="{escape(self.navigation_url)}">View</a>')
-                self.send_telegram("\n".join(lines))
-                self.log.info(
-                    f"Auto-registered ({note}): {slot['support']} {slot['date']} {slot['time']}"
-                )
-                return True
-
+                self._set_current_registration(slot, req, dtype)
+                self._notify_registered(slot, note, dtype, replaced)
+                return slot, False
             if note == "needs partner":
-                if not req.get("warned_partner"):
-                    self.send_telegram(
-                        "⚠️ A matching slot is open but it's a <b>team boat</b> and no "
-                        "partner is set. Send /partner &lt;name&gt; and I'll grab it, or "
-                        "keep only solo boats in the request."
-                    )
-                    req["warned_partner"] = True
-                self.log.info(f"Skip team slot (no partner): {slot['support']} {slot['date']} {slot['time']}")
+                self._warn_needs_partner(req, slot)
+            elif note == "quota":
+                self.log.info(
+                    f"Blocked by active-registration quota: "
+                    f"{slot['support']} {slot['date']} {slot['time']}"
+                )
+                return None, True
             else:
                 self.log.info(
                     f"Register attempt failed ({note}): {slot['support']} {slot['date']} {slot['time']}"
                 )
-        return False
+        return None, False
+
+    def _verify_current_registration(self):
+        """Check the held booking against the site; clear it when it's gone.
+
+        A booking whose slot has started is left alone (the site refuses
+        cancellation after the start, so it can't be upgraded either); once the
+        slot is over it's cleared silently — the booking was simply used.
+        """
+        reg = self.current_registration
+        if reg is None:
+            return
+        now = datetime.now()
+        start_dt, end_dt = self._registration_times(reg)
+        try:
+            reg_day = date.fromisoformat(reg.get("day", ""))
+        except (TypeError, ValueError):
+            reg_day = None
+        over = (end_dt is not None and now >= end_dt) or (
+            end_dt is None and (reg_day is None or reg_day < date.today())
+        )
+        if over:
+            self.log.info(
+                f"Booking over — clearing: {reg.get('support')} {reg.get('day')} {reg.get('time')}"
+            )
+            self.current_registration = None
+            return
+        in_progress = (start_dt is not None and now >= start_dt) or (
+            start_dt is None and reg_day == date.today()
+        )
+        if in_progress:
+            return
+        status, _, _ = self._slot_status(reg["href"])
+        if status == "error":
+            return  # transient fetch problem; keep our belief
+        if status != "registered":
+            self.send_telegram(
+                "ℹ️ Your booking is no longer on the site (cancelled outside the bot?):\n"
+                f"{self._format_registration(reg)}\n"
+                "Pending requests stay armed."
+            )
+            self.log.info(f"Booking disappeared from the site: {reg}")
+            self.current_registration = None
+
+    def _discover_registration(self, slots):
+        """Find a booking made outside the bot from the parsed listing slots.
+
+        The listing flags the booked slot with an `a.in` "inscrit" link (the
+        account page does NOT list Navigation libre bookings — verified live).
+        A booking whose slot already started has left the listing and stays
+        undiscoverable; it can't be cancelled anyway.
+        """
+        for slot in slots:
+            if not slot.get("registered"):
+                continue
+            slot_date = self._parse_slot_date(slot["date"])
+            reg = {
+                "href": slot["href"],
+                "day": slot_date.isoformat() if slot_date else "",
+                "time": slot.get("time", ""),
+                "support": slot.get("support", ""),
+                "priority": None,
+                "partner": "",
+                "dtype": slot.get("dtype"),
+                "registered_at": time.time(),
+            }
+            self.log.info(f"Discovered existing booking on the site: {reg}")
+            return reg
+        return None
+
+    def _adopt_matching_requests(self):
+        """Fold pending requests already satisfied by the held booking into it.
+
+        The booking takes the best (lowest) priority among the requests it
+        satisfies, so only strictly better requests will replace it later.
+        """
+        reg = self.current_registration
+        if reg is None or not self.registration_requests:
+            return
+        start_min, _ = self._parse_slot_time_range(reg.get("time", ""))
+        support = _normalize(reg.get("support", ""))
+        kept, adopted = [], []
+        for req in self.registration_requests:
+            matches = (
+                req["day"] == reg.get("day")
+                and (req.get("hour_min") is None or req["hour_min"] == start_min)
+                and any(boat in support for boat in req["boats"])
+            )
+            (adopted if matches else kept).append(req)
+        if not adopted:
+            return
+        best = min(r.get("priority", 5) for r in adopted)
+        if reg.get("priority") is None or best < reg["priority"]:
+            reg["priority"] = best
+        self.registration_requests = kept
+        for req in adopted:
+            self.log.info(f"Request satisfied by existing booking: {req}")
+        label = "this request" if len(adopted) == 1 else f"{len(adopted)} requests"
+        self.send_telegram(
+            f"ℹ️ Your existing booking already covers {label}:\n"
+            + "\n".join(self._format_request(r) for r in adopted)
+            + f"\n\nTracking it as:\n{self._format_registration(reg)}"
+        )
+
+    def _try_upgrade(self, slots):
+        """Swap the held booking for the best strictly-higher-priority open slot.
+
+        Keeps the no-booking window small: a candidate is first confirmed viable
+        (page reachable, right type, partner available), only then the current
+        booking is cancelled and the new one registered; if that registration
+        fails the old slot is re-registered immediately.
+        """
+        reg = self.current_registration
+        reg_priority = reg.get("priority")  # None = manual booking, always outranked
+        now = datetime.now()
+        start_dt, _ = self._registration_times(reg)
+        if start_dt is not None:
+            if now >= start_dt:
+                return  # started: the site refuses cancellation
+        else:
+            try:
+                reg_day = date.fromisoformat(reg.get("day", ""))
+            except (TypeError, ValueError):
+                return
+            if reg_day <= date.today():
+                return  # can't prove it hasn't started yet — don't touch it
+        if reg.get("dtype") == "2" and not (reg.get("partner") or self.navigation_partner):
+            # A team booking whose partner name we don't know could not be
+            # re-registered if the upgrade failed — never risk it.
+            self.log.info("Upgrade skipped: held team booking has no partner name for rollback.")
+            return
+        for req in self.registration_requests:
+            if reg_priority is not None and req.get("priority", 5) >= reg_priority:
+                return  # requests are sorted: nothing better follows
+            candidates = [
+                s for s in self._request_candidates(req, slots)
+                if urldefrag(s["href"])[0] != urldefrag(reg["href"])[0]
+            ]
+            viable = []
+            for slot in candidates[:3]:
+                status, dtype, _ = self._slot_status(slot["href"])
+                # While we hold a booking every other slot reads "quota"; the
+                # fresh listing already said it has capacity, so accept both.
+                if status not in ("open", "quota"):
+                    continue
+                if dtype == "2" and not self.navigation_partner:
+                    self._warn_needs_partner(req, slot)
+                    continue
+                viable.append(slot)
+            if not viable:
+                continue
+            old = dict(reg)
+            ok, note = self.cancel_navigation_slot(reg["href"])
+            if not ok:
+                self.log.warning(f"Upgrade aborted — could not cancel current booking: {note}")
+                return
+            self.current_registration = None
+            booked, _ = self._register_from_candidates(req, viable, replaced=old)
+            if booked is not None:
+                self.registration_requests = [r for r in self.registration_requests if r is not req]
+                return
+            # Roll back: get the old slot back before someone else takes it.
+            ok2, note2, _ = self.register_navigation_slot(
+                old["href"], partner=old.get("partner") or self.navigation_partner or None
+            )
+            if ok2:
+                self.current_registration = old
+                self.send_telegram(
+                    "⚠️ Tried to upgrade to a better slot but the registration "
+                    f"failed — your original booking is safe:\n{self._format_registration(old)}"
+                )
+                self.log.warning("Upgrade failed; original booking restored.")
+            else:
+                self.send_telegram(
+                    "🚨 <b>Upgrade went wrong.</b> I cancelled your booking\n"
+                    f"{self._format_registration(old)}\n"
+                    f"but the new registration failed and re-booking the old slot also "
+                    f"failed ({escape(note2)}). <b>You have no booking right now</b> — "
+                    f'check <a href="{escape(self.navigation_url)}">the site</a>.'
+                )
+                self.log.error(f"Upgrade rollback failed ({note2}); no booking held.")
+            return
 
     def _process_registration_requests(self):
-        """Poll-loop hook: expire stale requests and try to fulfil the rest."""
+        """Poll-loop reconciler for auto-registration.
+
+        Invariants: at most one active booking (site rule); the booking held is
+        the one for the highest-priority fulfillable request; pending requests
+        stay armed until they expire, are cancelled, or are satisfied by (folded
+        into) a booking. Bookings made by hand on the site are discovered via
+        the account page and replaced when any armed request becomes fulfillable.
+        """
         with self._fetch_lock:
-            if not (self.navigation_enabled and self.registration_requests):
+            if not self.navigation_enabled:
                 return
-            resp = self._fetch_navigation_libre_page()
-            if resp is None:
-                self.log.warning("Registration fetch failed this pass; will retry next cycle.")
+            if not self.registration_requests and self.current_registration is None:
                 return
-            slots = self._parse_inscription_slots(BeautifulSoup(resp.text, "lxml"))
+
+            self._verify_current_registration()
+
             today_iso = date.today().isoformat()
-            remaining = []
-            changed = False
+            kept = []
             for req in self.registration_requests:
                 if req["day"] < today_iso:
                     self.send_telegram(
-                        f"⌛️ Registration request expired (no slot opened in time):\n{self._format_request(req)}"
+                        "⌛️ Registration request expired (no slot opened in time):\n"
+                        f"{self._format_request(req)}"
                     )
                     self.log.info(f"Registration request expired: {req}")
-                    changed = True
-                    continue
-                if self._try_register_request(req, slots):
-                    changed = True
-                    continue
-                remaining.append(req)
-            if changed:
-                self.registration_requests = remaining
+                else:
+                    kept.append(req)
+            self.registration_requests = kept
+
+            if not self.registration_requests:
                 self._save_state()
+                return
+
+            resp = self._fetch_navigation_libre_page()
+            if resp is None:
+                self.log.warning("Registration fetch failed this pass; will retry next cycle.")
+                self._save_state()
+                return
+            slots = self._parse_inscription_slots(BeautifulSoup(resp.text, "lxml"))
+
+            if self.current_registration is None:
+                discovered = self._discover_registration(slots)
+                if discovered is not None:
+                    self.current_registration = discovered
+            self._adopt_matching_requests()
+
+            if not self.registration_requests:
+                self._save_state()
+                return
+
+            if self.current_registration is None:
+                for req in list(self.registration_requests):
+                    candidates = self._request_candidates(req, slots)
+                    if not candidates:
+                        continue
+                    booked, quota_blocked = self._register_from_candidates(req, candidates)
+                    if booked is not None:
+                        self.registration_requests = [
+                            r for r in self.registration_requests if r is not req
+                        ]
+                        break
+                    if quota_blocked:
+                        if not req.get("warned_quota"):
+                            self.send_telegram(
+                                "⚠️ A slot you want is open, but your account already has "
+                                "an active registration that I can't locate (its slot may "
+                                "already be underway), and only one is allowed at a time. "
+                                "If you have a booking you don't need, cancel it on the "
+                                "site and I'll grab the slot:\n"
+                                f"{self._format_request(req)}"
+                            )
+                            req["warned_quota"] = True
+                        break
+            else:
+                self._try_upgrade(slots)
+            self._save_state()
 
     def send_telegram(self, message):
         url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
@@ -1234,11 +1647,14 @@ class SailingBot:
             "/unwatch &lt;boat&gt; — remove a boat from the filter\n"
             "/threshold &lt;kt&gt; — set the wind alert threshold\n"
             "\n<b>Auto-registration</b>\n"
-            "/register &lt;day&gt; &lt;hour&gt; &lt;boats&gt; — auto-sign-up for a nav libre slot\n"
-            "   e.g. <code>/register sat 10:00 RS aéro, Laser simple</code>\n"
-            "   day: today/tomorrow/sat/04.07 · hour: 10:00 or <code>any</code> · boats: comma-separated, priority order\n"
-            "/requests — list pending auto-registrations\n"
+            "/register [p1-9] &lt;day&gt; &lt;hour&gt; &lt;boats&gt; — auto-sign-up for a nav libre slot\n"
+            "   e.g. <code>/register p1 sat 10:00 RS aéro, Laser simple</code>\n"
+            "   day: today/tomorrow/sat/04.07 · hour: 10:00 or <code>any</code> · boats: comma-separated alternatives\n"
+            "   p1 = most wanted (default p5). Only one live booking at a time; when a\n"
+            "   higher-priority slot opens I cancel the current booking and switch to it.\n"
+            "/requests — pending auto-registrations + current booking\n"
             "/unregister &lt;n&gt; — cancel pending request number n\n"
+            "/unregister booking — cancel the current booking on the site\n"
             "/partner &lt;name&gt; — set the partner name for team boats"
         )
 
@@ -1257,6 +1673,8 @@ class SailingBot:
                 f"🧭 Navigation libre: on · lookahead {self.navigation_days_ahead} day(s)"
             )
             lines.append(f"   Boats: {', '.join(supports) if supports else 'all'}")
+            if self.current_registration:
+                lines.append(f"✅ Booked: {self._format_registration(self.current_registration)}")
             if self.registration_requests:
                 lines.append(f"🎯 Auto-register: {len(self.registration_requests)} pending (/requests)")
             if self.navigation_partner:
@@ -1367,15 +1785,25 @@ class SailingBot:
         self.send_telegram(f"✅ Wind alert threshold set to {value:.0f} kt.")
 
     _REGISTER_USAGE = (
-        "Usage: /register &lt;day&gt; &lt;hour&gt; &lt;boats&gt;\n"
-        "e.g. <code>/register sat 10:00 RS aéro, Laser simple</code>\n"
+        "Usage: /register [p1-p9] &lt;day&gt; &lt;hour&gt; &lt;boats&gt;\n"
+        "e.g. <code>/register p1 sat 10:00 RS aéro, Laser simple</code>\n"
+        "• p1–p9: optional priority, p1 = most wanted (default p5). Only one live "
+        "booking is possible — when a strictly higher-priority slot opens, I cancel "
+        "the current booking and take it\n"
         "• day: today, tomorrow, a weekday (sat/samedi), 04.07 or 04.07.2026\n"
         "• hour: a start time like 10:00, or <code>any</code> for any time that day\n"
-        "• boats: comma-separated, in priority order (I grab the first one that opens)"
+        "• boats: comma-separated alternatives — I grab the first one that opens"
     )
 
     def _parse_register_command(self, args):
         """Parse /register args into a request dict. Returns (req, error_message)."""
+        args = list(args)
+        priority = 5
+        if args:
+            match = re.fullmatch(r"[pP]([1-9])", args[0].strip())
+            if match:
+                priority = int(match.group(1))
+                args = args[1:]
         if len(args) < 3:
             return None, self._REGISTER_USAGE
         day = _parse_day_token(args[0])
@@ -1396,6 +1824,7 @@ class SailingBot:
             "hour_label": "any" if hour_min is None else f"{hour_min // 60:02d}:{hour_min % 60:02d}",
             "boats": [_normalize(b) for b in boats_label],
             "boats_label": boats_label,
+            "priority": priority,
             "created": time.time(),
         }
         return req, None
@@ -1409,42 +1838,96 @@ class SailingBot:
             self.send_telegram(error)
             return
         with self._fetch_lock:
-            # Try immediately in case a matching slot is already open, otherwise arm it.
-            booked = False
-            resp = self._fetch_navigation_libre_page()
-            if resp is not None:
-                slots = self._parse_inscription_slots(BeautifulSoup(resp.text, "lxml"))
-                booked = self._try_register_request(req, slots)
-            if not booked:
-                self.registration_requests.append(req)
-                self._save_state()
-        if not booked:
-            self.send_telegram(
-                f"🎯 <b>Auto-register armed</b>\n{self._format_request(req)}\n\n"
-                "I'll grab the first matching slot the moment it opens and message you. "
-                "Send /requests to review or /unregister to cancel."
-            )
+            self.registration_requests.append(req)
+            self._sort_requests()
+            self._save_state()
+            # One reconcile pass right away: books it if a matching slot is
+            # already open, upgrading away from a lesser booking if needed.
+            self._process_registration_requests()
+            still_pending = any(r is req for r in self.registration_requests)
+            reg = self.current_registration
+        if still_pending:
+            lines = [f"🎯 <b>Auto-register armed</b>\n{self._format_request(req)}", ""]
+            if reg is None:
+                lines.append("I'll grab the first matching slot the moment it opens and message you.")
+            elif reg.get("priority") is None or req["priority"] < reg["priority"]:
+                lines.append(
+                    f"You're currently booked on:\n{self._format_registration(reg)}\n"
+                    "I'll switch to this request the moment a matching slot opens."
+                )
+            else:
+                lines.append(
+                    f"You're currently booked on:\n{self._format_registration(reg)}\n"
+                    "This request doesn't outrank that booking, so it stays armed as a "
+                    "fallback. Give it a lower p-number than the booking to make me switch."
+                )
+            lines.append("Send /requests to review or /unregister to cancel.")
+            self.send_telegram("\n".join(lines))
 
     def _cmd_requests(self, args):
         with self._fetch_lock:
             reqs = list(self.registration_requests)
+            reg = self.current_registration
+        lines = []
+        if reg is not None:
+            lines.append(f"✅ <b>Current booking</b>\n{self._format_registration(reg)}")
+            lines.append("")
         if not reqs:
-            self.send_telegram("🎯 No pending auto-registrations. Add one with /register.")
+            lines.append("🎯 No pending auto-registrations. Add one with /register.")
+            self.send_telegram("\n".join(lines))
             return
-        lines = [f"🎯 <b>Pending auto-registrations</b> — {len(reqs)}"]
+        lines.append(f"🎯 <b>Pending auto-registrations</b> — {len(reqs)}")
         for i, req in enumerate(reqs, 1):
             lines.append(f"\n<b>{i}.</b> {self._format_request(req)}")
-        lines.append("\n<i>Cancel one with /unregister &lt;n&gt;</i>")
+        lines.append("\n<i>Cancel one with /unregister &lt;n&gt;"
+                     + (" · cancel the booking with /unregister booking</i>" if reg else "</i>"))
         self.send_telegram("\n".join(lines))
 
     def _cmd_unregister(self, args):
+        if args and args[0].lower() in ("booking", "current", "held"):
+            with self._fetch_lock:
+                # Refresh the session first (re-logs in if expired) so the
+                # cancel below sees the real page, not a login redirect; the
+                # fetched listing doubles as the discovery source.
+                resp = self._fetch_navigation_libre_page()
+                reg = self.current_registration
+                if reg is None and resp is not None:
+                    reg = self._discover_registration(
+                        self._parse_inscription_slots(BeautifulSoup(resp.text, "lxml"))
+                    )
+                if reg is None:
+                    self.send_telegram(
+                        "✅ No active booking that I know of."
+                        if resp is not None
+                        else "⚠️ Couldn't reach the site to check for a booking. Try again."
+                    )
+                    return
+                ok, note = self.cancel_navigation_slot(reg["href"])
+                if ok:
+                    self.current_registration = None
+                    self._save_state()
+            if ok:
+                self.send_telegram(f"🗑️ Booking cancelled:\n{self._format_registration(reg)}")
+            else:
+                self.send_telegram(
+                    f"⚠️ Couldn't cancel the booking ({escape(note)}). "
+                    "It may have already started."
+                )
+            return
         with self._fetch_lock:
             count = len(self.registration_requests)
             if not count:
-                self.send_telegram("🎯 No pending auto-registrations to cancel.")
+                self.send_telegram(
+                    "🎯 No pending auto-registrations to cancel."
+                    + ("\nCancel the booking itself with /unregister booking."
+                       if self.current_registration else "")
+                )
                 return
             if not args or not args[0].isdigit():
-                self.send_telegram(f"Usage: /unregister &lt;n&gt;  (1–{count}). See /requests.")
+                self.send_telegram(
+                    f"Usage: /unregister &lt;n&gt;  (1–{count}, see /requests), "
+                    "or /unregister booking to cancel the current booking."
+                )
                 return
             index = int(args[0])
             if not 1 <= index <= count:
