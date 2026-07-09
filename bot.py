@@ -332,6 +332,10 @@ class SailingBot:
         self.instructor_overrides = list(instructor_overrides) if instructor_overrides is not None else None
         if state.get("wind_threshold_kt") is not None:
             self.wind_alert_threshold_kt = float(state["wind_threshold_kt"])
+        if state.get("course_days_ahead") is not None:
+            self.course_days_ahead = int(state["course_days_ahead"])
+        if state.get("navigation_days_ahead") is not None:
+            self.navigation_days_ahead = int(state["navigation_days_ahead"])
         self._last_heartbeat = state.get("last_heartbeat", 0.0)
         self.registration_requests = state.get("registration_requests") or []
         for req in self.registration_requests:
@@ -360,6 +364,8 @@ class SailingBot:
             "course_type_overrides": self.course_type_overrides,
             "instructor_overrides": self.instructor_overrides,
             "wind_threshold_kt": self.wind_alert_threshold_kt,
+            "course_days_ahead": self.course_days_ahead,
+            "navigation_days_ahead": self.navigation_days_ahead,
             "last_heartbeat": self._last_heartbeat,
             "registration_requests": self.registration_requests,
             "current_registration": self.current_registration,
@@ -1675,6 +1681,7 @@ class SailingBot:
             "/watch": self._cmd_watch,
             "/unwatch": self._cmd_unwatch,
             "/filters": self._cmd_filters,
+            "/lookahead": self._cmd_lookahead,
             "/watchcourse": self._cmd_watchcourse,
             "/unwatchcourse": self._cmd_unwatchcourse,
             "/watchinstructor": self._cmd_watchinstructor,
@@ -1708,6 +1715,7 @@ class SailingBot:
             "/watchcourse /unwatchcourse &lt;type&gt; — edit the course-type filter\n"
             "/watchinstructor /unwatchinstructor &lt;name&gt; — edit the instructor filter\n"
             "/watch /unwatch &lt;boat&gt; — edit the navigation libre boat filter\n"
+            "/lookahead [courses|nav] &lt;days&gt; — how far ahead to watch\n"
             "/threshold &lt;kt&gt; — set the wind alert threshold\n"
             "\n<b>Auto-registration</b>\n"
             "/register [p1-9] &lt;day&gt; &lt;hour&gt; &lt;boats&gt; — auto-sign-up for a nav libre slot\n"
@@ -1866,7 +1874,10 @@ class SailingBot:
             lines.append(f"Types: {shown('course type')}")
             lines.append(f"Instructors: {shown('instructor')}")
             lines.append(f"Lookahead: {self.course_days_ahead} day(s)")
-            lines.append("<i>Edit: /watchcourse /unwatchcourse /watchinstructor /unwatchinstructor</i>")
+            lines.append(
+                "<i>Edit: /watchcourse /unwatchcourse /watchinstructor /unwatchinstructor "
+                "/lookahead courses &lt;days&gt;</i>"
+            )
             if self.navigation_enabled:
                 lines.append("")
                 lines.append("🧭 <b>Navigation libre</b>")
@@ -1875,8 +1886,47 @@ class SailingBot:
                     rules = " · ".join(self._format_time_rule(r) for r in self.navigation_time_filters)
                     lines.append(f"Time rules: {escape(rules)} <i>(config.ini)</i>")
                 lines.append(f"Lookahead: {self.navigation_days_ahead} day(s)")
-                lines.append("<i>Edit: /watch /unwatch</i>")
+                lines.append("<i>Edit: /watch /unwatch /lookahead nav &lt;days&gt;</i>")
         self.send_telegram("\n".join(lines))
+
+    _LOOKAHEAD_USAGE = (
+        "Usage: /lookahead [courses|nav] &lt;days&gt;  (0–60)\n"
+        "e.g. <code>/lookahead courses 14</code> · <code>/lookahead nav 2</code>\n"
+        "A bare number sets both, e.g. <code>/lookahead 7</code>."
+    )
+
+    def _cmd_lookahead(self, args):
+        current = (
+            f"📅 Lookahead — courses: <b>{self.course_days_ahead}</b> day(s) · "
+            f"nav libre: <b>{self.navigation_days_ahead}</b> day(s)"
+        )
+        if not args:
+            self.send_telegram(f"{current}\n\n{self._LOOKAHEAD_USAGE}")
+            return
+        scope = None
+        rest = list(args)
+        token = _normalize(rest[0])
+        if token in ("course", "courses", "cours"):
+            scope, rest = "courses", rest[1:]
+        elif token in ("nav", "navigation", "navlibre"):
+            scope, rest = "nav", rest[1:]
+        if not rest or not rest[0].isdigit():
+            self.send_telegram(self._LOOKAHEAD_USAGE)
+            return
+        days = int(rest[0])
+        if not 0 <= days <= 60:
+            self.send_telegram("⚠️ Days must be between 0 (today only) and 60.")
+            return
+        with self._fetch_lock:
+            if scope in (None, "courses"):
+                self.course_days_ahead = days
+            if scope in (None, "nav"):
+                self.navigation_days_ahead = days
+            self._save_state()
+        self.send_telegram(
+            f"✅ Lookahead set — courses: <b>{self.course_days_ahead}</b> day(s) · "
+            f"nav libre: <b>{self.navigation_days_ahead}</b> day(s)"
+        )
 
     def _cmd_threshold(self, args):
         if not args:

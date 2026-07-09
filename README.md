@@ -157,6 +157,7 @@ Send these to the bot in chat:
 | `/watchinstructor <name>` / `/unwatchinstructor <name>` | Edit the instructor filter for course alerts (empty = all) |
 | `/watch <boat>` | Add a boat to the Navigation libre filter (e.g. `/watch RS aéro`) |
 | `/unwatch <boat>` | Remove a boat from the filter |
+| `/lookahead [courses\|nav] <days>` | How many days ahead to watch (0–60); bare number sets both |
 | `/threshold <kt>` | Set the wind alert threshold |
 | `/register [p1-9] <day> <hour> <boats>` | Auto-sign-up for a Navigation libre slot (see below) |
 | `/requests` | List pending auto-registrations and the current booking |
