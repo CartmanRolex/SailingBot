@@ -159,6 +159,16 @@ class SailingBot:
         self.course_url = self.config["settings"]["course_url"]
         self.log_file = self.config["settings"]["log_file"]
         self.state_file = self.config.get("settings", "state_file", fallback="state.json")
+        self.course_types_raw = [
+            v.strip() for v in self.config.get("filters", "course_types", fallback="").split(",") if v.strip()
+        ]
+        self.instructors_raw = [
+            v.strip() for v in self.config.get("filters", "instructors", fallback="").split(",") if v.strip()
+        ]
+        # Overrides (set via /watchcourse, /watchinstructor …) replace the
+        # config lists when non-None, like support_overrides does for boats.
+        self.course_type_overrides = None
+        self.instructor_overrides = None
         self.filter_courses = _parse_filter_list(self.config.get("filters", "course_types", fallback=""))
         self.filter_instructors = _parse_filter_list(self.config.get("filters", "instructors", fallback=""))
         self.course_days_ahead = _config_int(self.config, "filters", "days_ahead", fallback=21)
@@ -249,10 +259,47 @@ class SailingBot:
             return self.state_file
         return os.path.join(os.path.dirname(os.path.abspath(__file__)), self.state_file)
 
+    # Chat-editable alert filters: override attr (persisted in state.json,
+    # None = use config), config source attr, and recompute hook.
+    _FILTER_SPECS = {
+        "boat": {
+            "plural": "boats",
+            "example": "RS aéro",
+            "override_attr": "support_overrides",
+            "raw_attr": "navigation_supports_raw",
+            "apply": "_apply_support_overrides",
+        },
+        "course type": {
+            "plural": "course types",
+            "example": "Catamaran",
+            "override_attr": "course_type_overrides",
+            "raw_attr": "course_types_raw",
+            "apply": "_apply_course_filter_overrides",
+        },
+        "instructor": {
+            "plural": "instructors",
+            "example": "Marine",
+            "override_attr": "instructor_overrides",
+            "raw_attr": "instructors_raw",
+            "apply": "_apply_course_filter_overrides",
+        },
+    }
+
+    def _filter_values(self, kind):
+        """Effective raw (display) values of one filter list."""
+        spec = self._FILTER_SPECS[kind]
+        override = getattr(self, spec["override_attr"])
+        return list(override) if override is not None else list(getattr(self, spec["raw_attr"]))
+
     def _apply_support_overrides(self):
         """Recompute the effective normalized support filter from overrides or config."""
         source = self.support_overrides if self.support_overrides is not None else self.navigation_supports_raw
         self.filter_navigation_supports = [_normalize(v) for v in source if v.strip()]
+
+    def _apply_course_filter_overrides(self):
+        """Recompute the normalized course-alert filters from overrides or config."""
+        self.filter_courses = [_normalize(v) for v in self._filter_values("course type") if v.strip()]
+        self.filter_instructors = [_normalize(v) for v in self._filter_values("instructor") if v.strip()]
 
     def _load_state(self):
         path = self._state_path()
@@ -261,10 +308,12 @@ class SailingBot:
                 state = json.load(f)
         except FileNotFoundError:
             self._apply_support_overrides()
+            self._apply_course_filter_overrides()
             return
         except (json.JSONDecodeError, OSError) as e:
             self.log.warning(f"Could not read state file {path}: {e}; starting fresh.")
             self._apply_support_overrides()
+            self._apply_course_filter_overrides()
             return
 
         course_keys = state.get("course_slot_keys")
@@ -277,6 +326,10 @@ class SailingBot:
         self.paused = bool(state.get("paused", False))
         overrides = state.get("support_overrides")
         self.support_overrides = list(overrides) if overrides is not None else None
+        course_overrides = state.get("course_type_overrides")
+        self.course_type_overrides = list(course_overrides) if course_overrides is not None else None
+        instructor_overrides = state.get("instructor_overrides")
+        self.instructor_overrides = list(instructor_overrides) if instructor_overrides is not None else None
         if state.get("wind_threshold_kt") is not None:
             self.wind_alert_threshold_kt = float(state["wind_threshold_kt"])
         self._last_heartbeat = state.get("last_heartbeat", 0.0)
@@ -288,6 +341,7 @@ class SailingBot:
         if state.get("navigation_partner") is not None:
             self.navigation_partner = state["navigation_partner"]
         self._apply_support_overrides()
+        self._apply_course_filter_overrides()
         self.log.info(
             f"Loaded state from {path} "
             f"({len(self._prev_slot_keys or [])} course key(s), "
@@ -303,6 +357,8 @@ class SailingBot:
             "telegram_offset": self._telegram_offset,
             "paused": self.paused,
             "support_overrides": self.support_overrides,
+            "course_type_overrides": self.course_type_overrides,
+            "instructor_overrides": self.instructor_overrides,
             "wind_threshold_kt": self.wind_alert_threshold_kt,
             "last_heartbeat": self._last_heartbeat,
             "registration_requests": self.registration_requests,
@@ -1618,6 +1674,11 @@ class SailingBot:
             "/resume": self._cmd_resume,
             "/watch": self._cmd_watch,
             "/unwatch": self._cmd_unwatch,
+            "/filters": self._cmd_filters,
+            "/watchcourse": self._cmd_watchcourse,
+            "/unwatchcourse": self._cmd_unwatchcourse,
+            "/watchinstructor": self._cmd_watchinstructor,
+            "/unwatchinstructor": self._cmd_unwatchinstructor,
             "/threshold": self._cmd_threshold,
             "/register": self._cmd_register,
             "/requests": self._cmd_requests,
@@ -1643,8 +1704,10 @@ class SailingBot:
             "/wind — current wind at Dorigny\n"
             "/pause — stop alerts\n"
             "/resume — resume alerts\n"
-            "/watch &lt;boat&gt; — add a boat to the navigation libre filter\n"
-            "/unwatch &lt;boat&gt; — remove a boat from the filter\n"
+            "/filters — show all alert filters\n"
+            "/watchcourse /unwatchcourse &lt;type&gt; — edit the course-type filter\n"
+            "/watchinstructor /unwatchinstructor &lt;name&gt; — edit the instructor filter\n"
+            "/watch /unwatch &lt;boat&gt; — edit the navigation libre boat filter\n"
             "/threshold &lt;kt&gt; — set the wind alert threshold\n"
             "\n<b>Auto-registration</b>\n"
             "/register [p1-9] &lt;day&gt; &lt;hour&gt; &lt;boats&gt; — auto-sign-up for a nav libre slot\n"
@@ -1663,10 +1726,12 @@ class SailingBot:
         lines.append("⏸️ Alerts: <b>paused</b>" if self.paused else "▶️ Alerts: <b>active</b>")
         lines.append(f"⏱ Poll interval: {self.interval}s")
         lines.append(f"📅 Course lookahead: {self.course_days_ahead} day(s)")
-        if self.filter_courses:
-            lines.append(f"⛵ Course filter: {', '.join(self.filter_courses)}")
-        if self.filter_instructors:
-            lines.append(f"👤 Instructor filter: {', '.join(self.filter_instructors)}")
+        course_types = self._filter_values("course type")
+        if course_types:
+            lines.append(f"⛵ Course filter: {escape(', '.join(course_types))}")
+        instructors = self._filter_values("instructor")
+        if instructors:
+            lines.append(f"👤 Instructor filter: {escape(', '.join(instructors))}")
         if self.navigation_enabled:
             supports = self.support_overrides if self.support_overrides is not None else self.navigation_supports_raw
             lines.append(
@@ -1733,39 +1798,85 @@ class SailingBot:
             self._save_state()
         self.send_telegram("▶️ Alerts resumed.")
 
-    def _cmd_watch(self, args):
+    def _edit_filter(self, args, kind, add, command):
+        """Add/remove one entry of a chat-editable alert filter (see _FILTER_SPECS).
+
+        An empty resulting list means "no filter" — everything matches.
+        """
+        spec = self._FILTER_SPECS[kind]
         if not args:
-            self.send_telegram("Usage: /watch &lt;boat name&gt;  (e.g. /watch RS aéro)")
+            self.send_telegram(
+                f"Usage: /{command} &lt;{kind}&gt;  (e.g. /{command} {spec['example']})"
+            )
             return
         name = " ".join(args).strip()
         with self._fetch_lock:
-            current = list(self.support_overrides) if self.support_overrides is not None else list(self.navigation_supports_raw)
-            if any(_normalize(name) == _normalize(c) for c in current):
-                self.send_telegram(f"⚠️ Already watching “{escape(name)}”.")
-                return
-            current.append(name)
-            self.support_overrides = current
-            self._apply_support_overrides()
+            current = self._filter_values(kind)
+            if add:
+                if any(_normalize(name) == _normalize(c) for c in current):
+                    self.send_telegram(f"⚠️ Already watching {kind} “{escape(name)}”.")
+                    return
+                current.append(name)
+            else:
+                kept = [c for c in current if _normalize(c) != _normalize(name)]
+                if len(kept) == len(current):
+                    self.send_telegram(f"⚠️ “{escape(name)}” is not in the {kind} filter.")
+                    return
+                current = kept
+            setattr(self, spec["override_attr"], current)
+            getattr(self, spec["apply"])()
             self._save_state()
-        self.send_telegram(f"✅ Now watching: {escape(', '.join(current))}")
+        shown = escape(", ".join(current)) if current else f"all {spec['plural']}"
+        self.send_telegram(f"✅ Now watching {spec['plural']}: {shown}")
+
+    def _cmd_watch(self, args):
+        self._edit_filter(args, "boat", add=True, command="watch")
 
     def _cmd_unwatch(self, args):
-        if not args:
-            self.send_telegram("Usage: /unwatch &lt;boat name&gt;")
-            return
-        name = " ".join(args).strip()
+        self._edit_filter(args, "boat", add=False, command="unwatch")
+
+    def _cmd_watchcourse(self, args):
+        self._edit_filter(args, "course type", add=True, command="watchcourse")
+
+    def _cmd_unwatchcourse(self, args):
+        self._edit_filter(args, "course type", add=False, command="unwatchcourse")
+
+    def _cmd_watchinstructor(self, args):
+        self._edit_filter(args, "instructor", add=True, command="watchinstructor")
+
+    def _cmd_unwatchinstructor(self, args):
+        self._edit_filter(args, "instructor", add=False, command="unwatchinstructor")
+
+    def _format_time_rule(self, rule):
+        words = {"start_after": "from", "start_before": "start by", "end_after": "end after", "end_before": "until"}
+        parts = [
+            f"{words[key]} {minutes // 60:02d}:{minutes % 60:02d}"
+            for key, minutes in rule["constraints"].items()
+        ]
+        return f"{rule['raw_pattern']} {', '.join(parts)}"
+
+    def _cmd_filters(self, args):
+        def shown(kind):
+            values = self._filter_values(kind)
+            return escape(", ".join(values)) if values else "<i>all</i>"
+
         with self._fetch_lock:
-            current = list(self.support_overrides) if self.support_overrides is not None else list(self.navigation_supports_raw)
-            kept = [c for c in current if _normalize(c) != _normalize(name)]
-            if len(kept) == len(current):
-                self.send_telegram(f"⚠️ “{escape(name)}” was not in the watch list.")
-                return
-            self.support_overrides = kept
-            self._apply_support_overrides()
-            self._save_state()
-        self.send_telegram(
-            f"✅ Now watching: {escape(', '.join(kept)) if kept else 'all boats'}"
-        )
+            lines = ["<b>Alert filters</b>", ""]
+            lines.append("⛵ <b>Courses</b>")
+            lines.append(f"Types: {shown('course type')}")
+            lines.append(f"Instructors: {shown('instructor')}")
+            lines.append(f"Lookahead: {self.course_days_ahead} day(s)")
+            lines.append("<i>Edit: /watchcourse /unwatchcourse /watchinstructor /unwatchinstructor</i>")
+            if self.navigation_enabled:
+                lines.append("")
+                lines.append("🧭 <b>Navigation libre</b>")
+                lines.append(f"Boats: {shown('boat')}")
+                if self.navigation_time_filters:
+                    rules = " · ".join(self._format_time_rule(r) for r in self.navigation_time_filters)
+                    lines.append(f"Time rules: {escape(rules)} <i>(config.ini)</i>")
+                lines.append(f"Lookahead: {self.navigation_days_ahead} day(s)")
+                lines.append("<i>Edit: /watch /unwatch</i>")
+        self.send_telegram("\n".join(lines))
 
     def _cmd_threshold(self, args):
         if not args:

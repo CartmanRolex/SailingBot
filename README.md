@@ -152,6 +152,9 @@ Send these to the bot in chat:
 | `/nav` | Fetch & show current Navigation libre slots **now** (is it still free?) |
 | `/wind` | Current wind at Dorigny |
 | `/pause` / `/resume` | Stop / resume all push alerts (persisted) |
+| `/filters` | Show all alert filters (course types, instructors, boats, lookaheads) |
+| `/watchcourse <type>` / `/unwatchcourse <type>` | Edit the course-type filter for course alerts (empty = all) |
+| `/watchinstructor <name>` / `/unwatchinstructor <name>` | Edit the instructor filter for course alerts (empty = all) |
 | `/watch <boat>` | Add a boat to the Navigation libre filter (e.g. `/watch RS aéro`) |
 | `/unwatch <boat>` | Remove a boat from the filter |
 | `/threshold <kt>` | Set the wind alert threshold |
